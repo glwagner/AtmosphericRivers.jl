@@ -23,9 +23,9 @@ Breeze = {path = "../Breeze.jl"}
 NumericalEarth = {path = "../NumericalEarth.jl"}
 
 [compat]
-Breeze = "0.8"
+Breeze = "0.8 - 0.10"
 CUDA = "6"
 CairoMakie = "0.15"
 CopernicusClimateDataStore = "0.2"
-Oceananigans = "0.110"
+Oceananigans = "0.110 - 0.111"
 Reactant = "0.2.278"

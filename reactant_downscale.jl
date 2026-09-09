@@ -905,7 +905,11 @@ host_grid = LatitudeLongitudeGrid(CPU();
                                   halo = (5, 5, 5),
                                   topology = (Bounded, Bounded, Bounded))
 
-materialize_terrain!(host_grid, terrain_elevation)
+# AR_FLAT_TERRAIN=1: zero the orography (diagnostic). Isolates whether the ERA5-interior bottom-corner
+# blow-up is driven by the terrain / frame-taper-to-zero mismatch (flat ⇒ stable) or something else.
+flat_terrain = get(ENV, "AR_FLAT_TERRAIN", "0") == "1"
+materialize_terrain!(host_grid, flat_terrain ? ((λ, φ) -> zero(λ)) : terrain_elevation)
+flat_terrain && @info "AR_FLAT_TERRAIN=1: orography zeroed (diagnostic; not a physical downscale)"
 
 # `AR_TERRAIN_PATCH=<file.jld2>`: write the terrain into an existing snapshot file and exit.
 #
@@ -1211,8 +1215,19 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
 
     ## Metadata filenames encode the exact bounding box, so this padding must equal the one
     ## `predownload.jl` used (the dataset default, 0.5°) or every read is a cache miss. The files
-    ## must already be present: `CopernicusClimateDataStore` is deliberately NOT loaded here, so a
-    ## compute job can never sit in the CDS request queue.
+    ## must already be present in `era5_datadir`.
+    ##
+    ## The `glw/cleanup` NumericalEarth now routes `PrescribedAtmosphere(dir=…)` through
+    ## `download(::MetadataSet)`, whose per-`Metadata` method lives in the `CopernicusClimateDataStore`
+    ## extension — so without that package loaded the read dies with "No download method for
+    ## Metadata{ERA5HourlyPressureLevels,…}" even when every file is on disk (job 1325). Loading it is
+    ## SAFE here because the download path filters out files that already exist
+    ## (`!isfile`, `download_era5cli_month`), so a COMPLETE cache makes zero CDS requests — the earlier
+    ## "deliberately not loaded" stance held only while the read did its own cache check. `AR_LOAD_CDS=0`
+    ## restores the old behavior for anyone who wants the read to hard-fail rather than risk a request.
+    if get(ENV, "AR_LOAD_CDS", "1") == "1"
+        @eval import CopernicusClimateDataStore
+    end
     stage("reading ERA5 on the host: $(first(era5_dates)) … $(last(era5_dates)), $(summary(era5_region))")
     era5_atmosphere = PrescribedAtmosphere(era5_region, era5_dates, dataset;
                                            architecture = CPU(),
@@ -1241,7 +1256,17 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
         for n in 1:length(parent_times)
             scratch = CenterField(cpu_parent_grid)
             set!(scratch, era5_series[n])                 ## CPU→CPU, Oceananigans interpolates
-            copyto!(parent(destination[n]), parent(scratch))   ## host→device, whole parent
+            ## Fill the scratch HALOS before copying the whole array over. `set!(::Field, ::Field)`
+            ## only writes the interior, so a fresh `CenterField`'s halos stay 0 — and `copyto!` below
+            ## propagates those zeros to the device parent (the `T ∈ [0.0, …]` seen at every load). The
+            ## analytic parent never hits this because `set!(field, ::Function)` evaluates in the halos
+            ## too. Left unfilled, the child's lateral boundary + IC interpolation reads 0-valued parent
+            ## cells at the domain EDGES — worst at the CORNERS, where two boundaries meet — which seeds
+            ## a bottom-corner mass accumulation that the analytic IC tolerates (bounded) but the real
+            ## ERA5 state amplifies into a blow-up (ρᵈ → 20+; all four corners, k=1). Zero-gradient
+            ## (edge-extending) Bounded halos are what a properly-loaded parent carries.
+            Oceananigans.BoundaryConditions.fill_halo_regions!(scratch)
+            copyto!(parent(destination[n]), parent(scratch))   ## host→device, whole parent (halos incl.)
         end
     end
 
@@ -1476,9 +1501,121 @@ analytic_prognostics = merge((ρᵈ = initial_dry_density,
 ic_mode = Symbol(get(ENV, "AR_IC", "analytic"))
 
 if ic_mode === :interpolated
-    balancer = get(ENV, "AR_BALANCER", "0") == "1"
-    breeze_extension.initialize_nested_child!(nest, nothing, nothing, nothing; balancer)
-    stage("child initialized: INTERPOLATED from the parent (balancer $(balancer ? "on" : "off"))")
+    # The interpolated ERA5 IC is initialized on a CPU TWIN of the nest and copied to the device. Two
+    # steps of `initialize_nested_child!` cannot run on a Reactant grid, and BOTH matter for a stable
+    # real-ERA5 start:
+    #   * `set!(...; compute_reference_state=true)` → `reset_reference_state!` is shim-8-skipped on a
+    #     Reactant grid (3 KA/array-mode blockers), leaving the ERA5 interior on the standard-288 K
+    #     reference.
+    #   * the DFI `balancer` (adiabatic init) that removes the coarse-interpolation imbalance takes an
+    #     auto Δt from `minimum_zspacing(grid)` — a TRACED value on the device (shim 10) — fine on CPU.
+    # Both run correctly on `host_grid`, which the device `grid` is `on_architecture`'d FROM, so the two
+    # child grids are geometrically identical and a whole-array `copyto!` is exact. Without the balancer
+    # the raw interpolated state blows up when stepped (ρᵈ → 20+, ρu → 400+ by ~iter 40; runs 1357/1386
+    # — and the reference recompute ALONE did not fix it, the trajectory was ~identical, so the balancer
+    # is the operative piece). So: build the twin, run the FULL balanced init on it, and copy its
+    # balanced prognostic STATE + 3D reference onto the device child. The device's own
+    # `initialize_nested_child!` is then unnecessary (it would re-pay ~48 min of eager compilation) and
+    # is skipped. `AR_BALANCER=0` disables the DFI balance; `AR_IC_CPU_TWIN=0` reverts to on-device init.
+    balancer = get(ENV, "AR_BALANCER", "1") == "1"
+
+    if get(ENV, "AR_IC_CPU_TWIN", "1") == "1" && arch isa ReactantState
+        stage("interpolated IC on a CPU twin (balancer $(balancer ? "on" : "off"), reference recomputed)")
+
+        cpu_pgrid = LatitudeLongitudeGrid(CPU(); longitude = parent_λ, latitude = parent_φ, z = parent_z,
+                                          size = (parent_Nx, parent_Ny, length(parent_pressure_levels)),
+                                          halo = (5, 5, 5), topology = (Bounded, Bounded, Bounded))
+        ## CPU FieldTimeSeries mirroring each device parent field, its ERA5 data copied host-side.
+        cpu_fts(dev) = begin
+            f = FieldTimeSeries{Center, Center, Center}(cpu_pgrid, parent_times)
+            for n in 1:length(parent_times)
+                copyto!(parent(f[n]), Array(parent(dev[n])))
+            end
+            f
+        end
+        cpu_pressure = CenterField(cpu_pgrid)
+        set!(cpu_pressure, (λ, φ, z) -> isa_pressure(z))
+        cpu_parent = PrescribedAtmosphere(cpu_pgrid, parent_times;
+                                          velocities = (u = cpu_fts(u_parent), v = cpu_fts(v_parent)),
+                                          temperature = cpu_fts(T_parent),
+                                          specific_humidity = cpu_fts(q_parent),
+                                          microphysical_variables = (qᶜˡ = cpu_fts(qᶜˡ_parent),
+                                                                     qʳ = cpu_fts(qʳ_parent),
+                                                                     qᶜⁱ = cpu_fts(qᶜⁱ_parent),
+                                                                     qˢ = cpu_fts(qˢ_parent)),
+                                          pressure = cpu_pressure,
+                                          precipitation_flux = nothing)
+
+        ## Same nest as the device one (identical kwargs), on the CPU twin grid + a plain clock.
+        ## AR_BOTTOM_DRAG=<Cᴰ> adds a BulkDrag bottom stress (the bare nest otherwise has none, unlike
+        ## downscale.jl which gets surface drag from its ocean coupling). Diagnostic for whether the
+        ## ERA5-interior bottom-corner blow-up is undamped near-surface momentum. 0 disables.
+        twin_drag = parse(Float64, get(ENV, "AR_BOTTOM_DRAG", "0"))
+        cpu_nest = nested_atmosphere_model(cpu_parent, host_grid;
+                                           terrain = nothing,
+                                           relaxation_rate = 1/300,
+                                           relaxation_width = relax_width,
+                                           surface_pressure = p_std,
+                                           clock = Clock(time = zero(FT)),
+                                           dynamics = CompressibleDynamics(nested_time_discretization;
+                                                                           surface_pressure = p_std),
+                                           bottom_drag_coefficient = twin_drag > 0 ? twin_drag : nothing,
+                                           drag_surface_temperature = twin_drag > 0 ?
+                                               parse(FT, get(ENV, "AR_DRAG_TSFC", "285")) : nothing,
+                                           microphysics,
+                                           momentum_advection,
+                                           scalar_advection)
+        breeze_extension.initialize_nested_child!(cpu_nest, nothing, nothing, nothing; balancer)
+
+        ## ### `AR_TWIN_STEP_TEST=N`: step the CPU twin itself, to localize the ERA5-interior blow-up.
+        ## The device run blows up identically with reference recompute and with the DFI balancer (ρw
+        ## → −12 m/s in one step, ρᵈ → 20+; jobs 1357/1386/1387). Stepping the SAME balanced state on
+        ## the CPU twin — plain Julia/KA, no XLA, no traced clock — separates a genuine model
+        ## instability (blows up here too ⇒ Δt/substeps/vertical-interpolation) from a device/Reactant
+        ## numerical difference (stable here ⇒ the compiled path differs). Reports ρw/ρᵈ then exits.
+        let ntest = parse(Int, get(ENV, "AR_TWIN_STEP_TEST", "0"))
+            if ntest > 0
+                stage("CPU-twin step test: stepping the CPU nest $(ntest)× at Δt=$(Δt)s (no device compile)")
+                first_time_step!(cpu_nest, Δt)
+                for i in 0:ntest
+                    i > 0 && time_step!(cpu_nest, Δt)
+                    b = map(prognostic_fields(cpu_nest.child)) do f
+                        x = interior(f); (minimum(x), maximum(x),
+                                          sum(ifelse.(isfinite.(x), 0f0, 1f0)))
+                    end
+                    @info @sprintf("twin iter=%3d: %s", i,
+                                   join(["$name∈[$(round(lo,sigdigits=4)),$(round(hi,sigdigits=4))]$(bad==0 ? "" : " <$(Int(bad)) NF>")"
+                                         for (name, (lo, hi, bad)) in pairs(b)], ", "))
+                end
+                stage("CPU-twin step test done — exiting before the device compile")
+                exit(0)
+            end
+        end
+
+        ## Copy the balanced prognostic state, device ← CPU twin. `parent(f)` is the whole array, so
+        ## halos come along too (the twin's `update_state!` already filled them consistently).
+        cpu_prog = prognostic_fields(cpu_nest.child)
+        for (name, f) in pairs(prognostic_fields(nest.child))
+            copyto!(parent(f), Array(parent(cpu_prog[name])))
+        end
+        ## Copy the 3D reference (pressure/density/exner_function) too.
+        if !isnothing(nest.child.dynamics.reference_state)
+            dref = nest.child.dynamics.reference_state
+            cref = cpu_nest.child.dynamics.reference_state
+            for fname in (:pressure, :density, :exner_function)
+                copyto!(parent(getfield(dref, fname)), Array(parent(getfield(cref, fname))))
+            end
+        end
+        let r = cpu_nest.child.dynamics.reference_state
+            stage(@sprintf("interpolated IC: copied balanced state + reference from CPU twin \
+                            (ref p ∈ [%.0f, %.0f] Pa, ρ ∈ [%.4g, %.4g] kg/m³)",
+                           minimum(interior(r.pressure)), maximum(interior(r.pressure)),
+                           minimum(interior(r.density)), maximum(interior(r.density))))
+        end
+    else
+        breeze_extension.initialize_nested_child!(nest, nothing, nothing, nothing; balancer)
+        stage("child initialized: INTERPOLATED on-device (balancer $(balancer ? "on" : "off"))")
+    end
 else
     ## Any prognostic the analytic state does not name — ρw and the precipitating species — starts at
     ## rest/zero, zeroed on the raw array so no Field-level broadcast is involved.
