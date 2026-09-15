@@ -44,7 +44,13 @@
 #
 # writes the UNOPTIMIZED StableHLO for one step to `unopt_ar.mlir` (`AR_HLO_PATH` to redirect) and
 # stops before the XLA compile — the cheap way to see exactly which kernels a step of the nest emits,
-# without waiting out the optimizer and codegen.
+# without waiting out the optimizer and codegen. Kernels stay as `enzymexla.kernel_call`s there, so
+# the file is for READING, not for feeding to another compiler.
+#
+# `AR_HLO=optimized` instead runs Reactant's full pipeline (the raise included) and writes the plain
+# StableHLO that XLA itself receives, to `stablehlo_ar_optimized.mlir` plus a `.gz`. That one IS a
+# standalone reproducer: `hlo-opt`/`run_hlo_module` take it with no Julia and no Reactant. Use it to
+# hand off the coupled model's pathological XLA compile — see `slurm/coupled_hlo_dump.batch`.
 #
 # ## Gradients instead of a trajectory
 #
@@ -108,10 +114,19 @@
 #   reached while regularizing the `Interpolated` lateral boundaries). The first is only a printout, so
 #   the parent's stage line is assembled from host-side numbers instead; the second is a real check
 #   worth keeping, so the nest is built inside `Reactant.@allowscalar`.
-# - Independent of Reactant: NumericalEarth's Breeze↔ESM interface is not defined for a `NestedModel`
-#   atmosphere, so `AtmosphereOceanModel` throws a `MethodError` (`thermodynamics_parameters`) —
-#   `downscale.jl`'s "coupling a `NestedModel` to an ocean is an untested code path" caveat, met. The
-#   coupled-model section below falls back to stepping the bare nest when that happens.
+# - Coupling the nest to the ocean WORKS now (job 6118); it did not for most of this script's life,
+#   and the fallback below is kept for checkouts where it still does not. Three separate failures had
+#   to be cleared, each hidden behind the one before it:
+#     * NumericalEarth's Breeze↔ESM interface not being defined for a `NestedModel` atmosphere, so
+#       `AtmosphereOceanModel` threw a `MethodError` (`thermodynamics_parameters`) — `downscale.jl`'s
+#       "coupling a `NestedModel` to an ocean is an untested code path" caveat, met. The
+#       `NestedModel` → child forwards on NumericalEarth `pb/cleanup` supply it.
+#     * The exchanger's eager `surface_precipitation_flux` computation not compiling
+#       (`InvalidIRError: … jl_f_throw_methoderror`), fixed upstream by Oceananigans b2ea52a84.
+#     * `PrescribedOcean`'s own exchanger scalar-indexing a `FieldTimeSeries` view, fixed in
+#       NumericalEarth's `copy_prescribed_time_level!`.
+#   `minrepro_coupled.jl` is the write-up, and `slurm/coupling_probe.batch` re-answers "does it
+#   couple" in ~25 min without paying for the compile.
 
 using NumericalEarth
 using Oceananigans
@@ -138,10 +153,60 @@ include("case.jl")
 
 ## AR_BACKEND=gpu compiles for the GPU (the cluster case); "cpu" keeps everything host-side, which
 ## is what makes this script runnable on a laptop.
-Reactant.set_default_backend(get(ENV, "AR_BACKEND", "cpu"))
+# ## `AR_ARCH=cuda`: the same model with Reactant taken out of the loop
+#
+# A CONTROL, not a production mode. Everything in this script — grid, nest, open boundaries, Davies
+# relaxation, coupling — is identical; only the architecture and the execution strategy change:
+# `ReactantState()` becomes `GPU()`, `@compile` becomes a direct call, `@jit` becomes a direct call,
+# and `step_for!`'s `@trace`d loop becomes an ordinary `for`. Kernels launch eagerly through
+# CUDA.jl/KernelAbstractions, which is what `downscale.jl` has always done.
+#
+# It exists to answer one question: when a result looks wrong, is Reactant responsible? Because
+# nothing else differs, a vanilla run that reproduces the same wrong answer exonerates the entire
+# Reactant stack, and one that does not localizes the fault to it.
+#
+# Two consequences worth knowing:
+#   * No XLA compile. The hours of `first_time_step!`/`step_for!` compilation disappear; the cost
+#     becomes ordinary Julia+PTX codegen on the first step, minutes rather than hours.
+#   * No fusion, and one kernel launch per operation per step, so the STEP is slower and every
+#     `@trace`-related constraint is lifted. `AR_PARENT_UNIFORM_Z=0` is reachable here for the same
+#     reason it is reachable under `AR_RAISE=0` — no raise, so no `scf.while` to fail on.
+const VANILLA = get(ENV, "AR_ARCH", "reactant") == "cuda"
+
+# ## `AR_NATIVE_PARENT=1`: build the parent the way `downscale.jl` does
+#
+# Everything below this file's `AR_PARENT=era5` block is a WORKAROUND. The natural call is
+# `nested_atmosphere_model(child_grid, dataset; dates, dir, …)`, which builds the parent
+# `PrescribedAtmosphere` through Oceananigans on the child grid's architecture — ERA5's true
+# per-column geopotential heights, real halos, `parent_padding` defaulting to the dataset's own
+# `default_horizontal_padding` (1/2° for ERA5, exactly what the cached files were downloaded with).
+# `downscale.jl` has always used it. This file could not: `architecture(child_grid)` is
+# `ReactantState()` there, and converting a `per_column_geopotential_discretization` to Reactant
+# allocated without bound — OOM-killed at 180 GB (job 4749) where the same parent builds on `CPU()`
+# in 33 s. Hence the hand-rolled substitute: read on the host, build a grid at standard-atmosphere
+# heights, `copyto!` whole arrays.
+#
+# Under `AR_ARCH=cuda` that constraint is GONE — `architecture(child_grid)` is `GPU()`, and the
+# native constructor is the same one `downscale.jl` runs every day. So this is the direct test of
+# the workaround itself: same grid, same physics settings, same dates, only the parent differs.
+#
+# It matters because the workaround is measurably producing bad forcing data. The Davies relaxation
+# and the `Interpolated` open BCs both drive the child toward `exchanger.prognostic`, and on the
+# hand-rolled parent those targets carry `ρᵈ` up to 2.76 kg/m³ (impossible for air), 172 non-finite
+# values per field, and θ = ρθ/ρᵈ down to 126 K where raw ERA5's minimum is 201 K — and
+# `p/(Rᵈ·126) = 2.76` closes the arithmetic, so both extremes are one phenomenon: real air
+# interpolated against zeros. Jobs 6707/6709 measured it; `AR_TARGET_PROBE_ONLY=1` re-measures it.
+#
+# This method also OWNS the initial condition (`initialize_nested_child!` runs inside it), so the
+# `AR_IC` branch below is skipped — `AR_BALANCER` still selects whether the DFI balance runs.
+const NATIVE_PARENT = get(ENV, "AR_NATIVE_PARENT", "0") == "1"
+
+## Skipped under AR_ARCH=cuda: this initializes an XLA GPU client, which reserves device memory that
+## CUDA.jl would then be competing with for no reason — nothing is compiled through XLA in that mode.
+VANILLA || Reactant.set_default_backend(get(ENV, "AR_BACKEND", "cpu"))
 Oceananigans.defaults.FloatType = Float32
 
-arch = ReactantState()
+arch = VANILLA ? GPU() : ReactantState()
 smoke = get(ENV, "AR_SMOKE", "0") == "1"
 
 # ## Workgroup alignment (`AR_ALIGN`)
@@ -1252,10 +1317,34 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
                     qᶜⁱ_parent => era5_atmosphere.microphysical_variables.qᶜⁱ,
                     qˢ_parent  => era5_atmosphere.microphysical_variables.qˢ)
 
+    ## Clamped (zero-gradient) extension of a field's interior into its halo, in place, on the host.
+    ## Order matters: x first, then y, then z, so that corner and edge halo cells — which belong to
+    ## two or three of these at once — are written from already-extended neighbours rather than from
+    ## the zeros they start at.
+    function extend_into_halo!(field)
+        a = parent(field)
+        Hx, Hy, Hz = Oceananigans.Grids.halo_size(field.grid)
+        Nx, Ny, Nz = size(field.grid)
+        for i in 1:Hx
+            a[i, :, :]           .= @view a[Hx + 1, :, :]
+            a[Hx + Nx + i, :, :] .= @view a[Hx + Nx, :, :]
+        end
+        for j in 1:Hy
+            a[:, j, :]           .= @view a[:, Hy + 1, :]
+            a[:, Hy + Ny + j, :] .= @view a[:, Hy + Ny, :]
+        end
+        for k in 1:Hz
+            a[:, :, k]           .= @view a[:, :, Hz + 1]
+            a[:, :, Hz + Nz + k] .= @view a[:, :, Hz + Nz]
+        end
+        return field
+    end
+
     for (destination, era5_series) in era5_sources
         for n in 1:length(parent_times)
             scratch = CenterField(cpu_parent_grid)
             set!(scratch, era5_series[n])                 ## CPU→CPU, Oceananigans interpolates
+
             ## Fill the scratch HALOS before copying the whole array over. `set!(::Field, ::Field)`
             ## only writes the interior, so a fresh `CenterField`'s halos stay 0 — and `copyto!` below
             ## propagates those zeros to the device parent (the `T ∈ [0.0, …]` seen at every load). The
@@ -1276,6 +1365,46 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
                        parent_Nx, parent_Ny, length(parent_pressure_levels), length(parent_times),
                        isempty(finite) ? NaN : minimum(finite), isempty(finite) ? NaN : maximum(finite),
                        length(finite), length(probe)))
+    end
+
+    ## WHERE are the zeros? A parent temperature of exactly 0 K is never data — the raw ERA5 file
+    ## has none (min 201 K) — so every one was manufactured on the way in, and the bounds line above
+    ## reports only that they exist. Which INDEX they occupy decides what is wrong:
+    ##   * halo-only        → `copyto!` below carries unfilled halos, fix by filling them
+    ##   * an interior FRAME → the parent grid is wider than the ERA5 data and `set!` silently
+    ##                         zero-fills outside the source (AR_PARENT_PADDING vs AR_ERA5_PADDING)
+    ##   * bottom levels     → below-ground fill in the source
+    ## Cheap: one host array already resident, a few reductions, no device work.
+    let probe = Array(parent(T_parent[1])),
+        halos = Oceananigans.Grids.halo_size(cpu_parent_grid),
+        Hx = halos[1], Hy = halos[2], Hz = halos[3],
+        nz = count(iszero, probe)
+
+        stage(@sprintf("parent T zeros: %d of %d cells (%.2f%%)", nz, length(probe),
+                       100nz / length(probe)))
+        if nz > 0
+            idx = findall(iszero, probe)
+            is = [I[1] for I in idx]; js = [I[2] for I in idx]; ks = [I[3] for I in idx]
+            ## Indices are into the HALO-INCLUSIVE parent array, so interior i runs Hx+1 : Hx+Nx.
+            interior_zeros = count(I -> Hx < I[1] <= Hx + parent_Nx &&
+                                        Hy < I[2] <= Hy + parent_Ny &&
+                                        Hz < I[3] <= Hz + length(parent_pressure_levels), idx)
+            stage(@sprintf("  i ∈ [%d, %d] (interior is %d:%d), j ∈ [%d, %d] (interior %d:%d), \
+                            k ∈ [%d, %d] (interior %d:%d)",
+                           minimum(is), maximum(is), Hx + 1, Hx + parent_Nx,
+                           minimum(js), maximum(js), Hy + 1, Hy + parent_Ny,
+                           minimum(ks), maximum(ks), Hz + 1, Hz + length(parent_pressure_levels)))
+            stage(@sprintf("  %d of %d zeros are INTERIOR (%.1f%%) — halo-only would be 0%%",
+                           interior_zeros, nz, 100interior_zeros / nz))
+        end
+    end
+
+    ## `AR_PARENT_PROBE_ONLY=1` stops here. The parent load is ~50 s and everything above is host
+    ## work, so this answers "what is in the parent?" without paying for the nest, the coupling or
+    ## any stepping.
+    if get(ENV, "AR_PARENT_PROBE_ONLY", "0") == "1"
+        stage("AR_PARENT_PROBE_ONLY=1 — stopping after the parent probe")
+        exit(0)
     end
 end
 
@@ -1309,15 +1438,39 @@ aiva = get(ENV, "AR_AIVA", "0") == "1"
 #     `Float32` here) while `Clock(grid::ReactantGrid)` gives traced-but-`Float64` time, and
 #     `EarthSystemModel` refuses to adopt a clock whose time type differs from its components'.
 #
-# So: one traced clock at the grid's float type, handed to the nest and to the coupled model.
+# So: traced clocks at the grid's float type. Note the plural — the coupled model gets its OWN,
+# not the nest's. `EarthSystemModels.matching_clock` compares clock TIME TYPES, not identity, so two
+# separately-built clocks of the same type are accepted without coercion, and that is what is wanted:
+# `time_step!(::EarthSystemModel, Δt)` steps each component and THEN ticks its own clock, so a coupled
+# model handed the nest's clock object would tick it twice per step — model time running at 2Δt while
+# the dynamics advanced by Δt.
 
 FT = eltype(grid)
 
-model_clock = Clock(time = Reactant.ConcreteRNumber(zero(FT)),
-                    last_Δt = Reactant.ConcreteRNumber(FT(Inf)),
-                    last_stage_Δt = Reactant.ConcreteRNumber(FT(Inf)),
-                    iteration = Reactant.ConcreteRNumber(0),
-                    kernel_time_type = FT)
+# Requirement 1 is Reactant-specific, and under `AR_ARCH=cuda` it inverts: with nothing traced,
+# there is no compiled step to freeze the clock, and a `ConcreteRNumber` clock instead rides into
+# every KA kernel as a kernel ARGUMENT — where GPUCompiler rejects it outright, since a
+# `ConcretePJRTNumber` wraps an XLA buffer and a pointer-chasing struct is not a bitstype:
+#
+#     KernelError: passing non-bitstype argument … .time is of type ConcretePJRTNumber{Float32, 1}
+#       .data is of type Tuple{Reactant.XLA.PJRT.AsyncBuffer} which is not isbits.
+#
+# (job 6671, in `fill_bottom_and_top_halo!` — the clock reaches the halo fills through the model's
+# `fields` tuple). Requirement 2 is unchanged either way: same float type everywhere, or
+# `EarthSystemModel` refuses to adopt the clock.
+traced_clock() = VANILLA ?
+    Clock(time = zero(FT),
+          last_Δt = FT(Inf),
+          last_stage_Δt = FT(Inf),
+          iteration = 0,
+          kernel_time_type = FT) :
+    Clock(time = Reactant.ConcreteRNumber(zero(FT)),
+          last_Δt = Reactant.ConcreteRNumber(FT(Inf)),
+          last_stage_Δt = Reactant.ConcreteRNumber(FT(Inf)),
+          iteration = Reactant.ConcreteRNumber(0),
+          kernel_time_type = FT)
+
+model_clock = traced_clock()
 
 microphysics = breeze_extension.default_nested_microphysics()
 explicit_scalar_advection = breeze_extension.default_nested_scalar_advection(microphysics)
@@ -1396,7 +1549,52 @@ dynamics = CompressibleDynamics(nested_time_discretization; surface_pressure = p
 ## construction, so paying a device round-trip per element is nothing; the point of the guard (do not
 ## silently iterate a large device array) is not in play. Scoped to this call so nothing else inherits
 ## the permission — and a scalar loop over an actual FIELD would show up as a stall, not a wrong answer.
-nest = Reactant.@allowscalar nested_atmosphere_model(parent_atmosphere, grid;
+nest = if NATIVE_PARENT
+    VANILLA || error("AR_NATIVE_PARENT=1 requires AR_ARCH=cuda: the native constructor builds the \
+                      parent on `architecture(child_grid)`, and doing that on ReactantState is the \
+                      180 GB OOM (job 4749) this file's hand-rolled parent exists to avoid.")
+    stage("building the nest NATIVELY from the dataset (AR_NATIVE_PARENT=1) — ERA5 per-column \
+           geopotential heights, dataset-default padding, and the IC done by initialize_nested_child!")
+    ## Terrain: hand the blend an elevation FIELD, and give it the UNTAPERED orography.
+    ##
+    ## `materialize_nested_terrain!` takes "an elevation `Field`, or a topography dataset", so the
+    ## idealized range defined above can go through exactly the path `downscale.jl` uses for
+    ## `ETOPO2022()` — no ETOPO download needed (its scratchspace is empty on this cluster).
+    ##
+    ## Untapered on purpose. The `terrain_elevation` taper exists because the HAND-ROLLED parent is
+    ## flat and knows nothing about its own orography: `surface_elevation` returns `nothing` for a
+    ## plain `LatitudeLongitudeGrid`, so the child's ground had to be forced to zero at the walls by
+    ## hand. The native parent is a `PressureLevelGrid` and DOES know its surface elevation, so the
+    ## blend can match the child's ground to the orography the parent state was actually produced
+    ## with — which is the real requirement, and strictly better than flattening to zero.
+    ##
+    ## Getting this wrong is not cosmetic: job 6734 ran native-parent with `terrain = nothing`, so no
+    ## blend happened and the child kept ground tapered to zero underneath a parent with real
+    ## orography. The mismatch showed up as `ρv` reaching -418 (v ≈ -320 m/s), far worse than the
+    ## hand-rolled run's -94.
+    native_terrain = Field{Center, Center, Nothing}(grid)
+    set!(native_terrain, (λ, φ) -> orography(λ, φ))
+
+    nested_atmosphere_model(grid, dataset;
+                            dates = start_date:Hour(1):(start_date + Hour(2)),
+                            dir = era5_datadir,
+                            terrain = native_terrain,
+                            terrain_blend_length,
+                            terrain_smoothing_passes = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2")),
+                            relaxation_rate = 1/300,
+                            relaxation_width = relax_width,
+                            ## Passed explicitly so the anchor matches `dynamics` below, which was
+                            ## built with it — otherwise this method derives its own from the
+                            ## dataset's domain-mean surface pressure and the two disagree.
+                            surface_pressure = p_std,
+                            clock = model_clock,
+                            dynamics,
+                            microphysics,
+                            momentum_advection,
+                            scalar_advection,
+                            balancer = get(ENV, "AR_BALANCER", "0") == "1")
+else
+    Reactant.@allowscalar nested_atmosphere_model(parent_atmosphere, grid;
                                                      terrain = nothing,
                                                      relaxation_rate = 1/300,
                                                      relaxation_width = relax_width,
@@ -1406,8 +1604,85 @@ nest = Reactant.@allowscalar nested_atmosphere_model(parent_atmosphere, grid;
                                                      microphysics,
                                                      momentum_advection,
                                                      scalar_advection)
+end
 
 child = nest.child
+
+# `AR_TARGET_PROBE_ONLY=1`: dump the Davies/open-BC TARGET fields and stop.
+#
+# Both the lateral BCs and the interior relaxation drive the child toward `exchanger.prognostic` —
+# density-weighted prognostics precomputed from the parent's raw state ON THE PARENT GRID
+# (`breeze_nested_atmosphere.jl` lines 6-8), including `ρᵈ` itself, which is nudged alongside `ρθ`
+# following WRF and MPAS. So the relaxation operator is SYMMETRIC in mass and heat, and a run that
+# gains mass without gaining heat cannot be explained by the operator — only by targets that
+# disagree with each other. This reads them directly, which no trajectory run can do: by the time a
+# wrong target shows up in `ρᵈ`, it has already been advected, relaxed and mixed.
+#
+# Costs the nest build (~140 s under AR_ARCH=cuda) and nothing else — no coupling, no compile,
+# no stepping.
+if get(ENV, "AR_TARGET_PROBE_ONLY", "0") == "1"
+    let prog = nest.exchanger.prognostic
+        stage("Davies/BC target fields on the PARENT grid (exchanger.prognostic), time level 1:")
+        for (nm, fts) in pairs(prog)
+            a = Array(parent(fts[1]))
+            fin = filter(isfinite, a)
+            stage(@sprintf("  %-4s ∈ [%12.5g, %12.5g]  zeros=%7d  nonfinite=%7d  of %d",
+                           nm, isempty(fin) ? NaN : minimum(fin), isempty(fin) ? NaN : maximum(fin),
+                           count(iszero, a), length(a) - length(fin), length(a)))
+        end
+        ## The derived intensive quantity is what actually went wrong in the child (θ collapsed to
+        ## 114 K while ρθ stayed flat), so form it on the target too: if θ_target is already broken
+        ## on the parent grid, the child is faithfully chasing a broken target and the fault is in
+        ## the precomputation, not in the relaxation or the boundary condition.
+        ##
+        ## NOTE the threshold is one-sided, and deliberately so. `ρθ` is density-weighted POTENTIAL
+        ## temperature, which rises steeply with height: ~284 K at the surface and ~450-500 K at the
+        ## parent's 70 hPa lid are both correct (the child's own initial state reads 438 K at the
+        ## model top). So a HIGH θ is not evidence of anything. A low one is: atmospheric θ does not
+        ## go below ~250 K anywhere, so θ < 250 K can only be contamination.
+        if haskey(prog, :ρᵈ) && haskey(prog, :ρθ)
+            ρ = Array(parent(prog.ρᵈ[1])); ρθ = Array(parent(prog.ρθ[1]))
+            ok = findall(x -> isfinite(x) && x > 0, ρ)
+            θ = [ρθ[I] / ρ[I] for I in ok]
+            stage(@sprintf("  θ_target = ρθ/ρᵈ ∈ [%.2f, %.2f] K over %d cells with ρᵈ > 0",
+                           minimum(θ), maximum(θ), length(θ)))
+            for lim in (250, 200, 150)
+                stage(@sprintf("  θ_target < %d K: %d cells (%.3f%%)  [high θ is physical, not checked]",
+                               lim, count(<(lim), θ), 100count(<(lim), θ) / length(θ)))
+            end
+            bad = count(<(250), θ)
+
+            ## WHERE the bad targets sit decides whether this is a physics error or an ugly halo the
+            ## child never reads. `ρᵈ` is relaxed toward these values inside the 5-cell rind, so an
+            ## INTERIOR bad target is forcing the child directly; a halo-only one is inert.
+            badI = [I for (I, t) in zip(ok, θ) if t < 250]
+            if !isempty(badI)
+                halos = Oceananigans.Grids.halo_size(parent_grid)
+                Hx, Hy, Hz = halos[1], halos[2], halos[3]
+                Nlev = length(parent_pressure_levels)
+                isint(I) = Hx < I[1] <= Hx + parent_Nx && Hy < I[2] <= Hy + parent_Ny &&
+                           Hz < I[3] <= Hz + Nlev
+                ni = count(isint, badI)
+                stage(@sprintf("  θ_target < 250 K: i ∈ [%d, %d] (interior %d:%d), j ∈ [%d, %d] \
+                                (interior %d:%d), k ∈ [%d, %d] (interior %d:%d)",
+                               minimum(I[1] for I in badI), maximum(I[1] for I in badI), Hx + 1, Hx + parent_Nx,
+                               minimum(I[2] for I in badI), maximum(I[2] for I in badI), Hy + 1, Hy + parent_Ny,
+                               minimum(I[3] for I in badI), maximum(I[3] for I in badI), Hz + 1, Hz + Nlev))
+                stage(@sprintf("  %d of %d cold θ_target cells are INTERIOR (%.1f%%)",
+                               ni, length(badI), 100ni / length(badI)))
+                if ni > 0
+                    intI = filter(isint, badI)
+                    stage(@sprintf("    interior bad cells: k ∈ [%d, %d] (of %d levels, interior k=%d is the SURFACE)",
+                                   minimum(I[3] for I in intI) - Hz, maximum(I[3] for I in intI) - Hz,
+                                   Nlev, 1))
+                end
+            end
+        end
+    end
+    stage("AR_TARGET_PROBE_ONLY=1 — stopping after the target probe")
+    exit(0)
+end
+
 stage("nest built (exchanger window filled, open BCs + Davies forcing in place); " *
       "$(acoustic_substeps) acoustic substeps per step (host-decided at CFL $(acoustic_cfl)); " *
       "upper sponge $(isnothing(sponge) ? "OFF" : "on")")
@@ -1500,7 +1775,13 @@ analytic_prognostics = merge((ρᵈ = initial_dry_density,
 # function's own docstring: skipping it isolates whether the interpolated IC steps stably on its own.
 ic_mode = Symbol(get(ENV, "AR_IC", "analytic"))
 
-if ic_mode === :interpolated
+if NATIVE_PARENT
+    ## Already done inside `nested_atmosphere_model(grid, dataset; …)`, from the real dataset at
+    ## `first(dates)` rather than from `nothing` — calling it again here would redo the same
+    ## interpolation against a parent it would have to rediscover.
+    stage("child initialized: by nested_atmosphere_model(grid, dataset) itself \
+           (balancer $(get(ENV, "AR_BALANCER", "0") == "1" ? "on" : "off"))")
+elseif ic_mode === :interpolated
     # The interpolated ERA5 IC is initialized on a CPU TWIN of the nest and copied to the device. Two
     # steps of `initialize_nested_child!` cannot run on a Reactant grid, and BOTH matter for a stable
     # real-ERA5 start:
@@ -1749,22 +2030,54 @@ end
 
 # ## Coupled model
 #
-# `AtmosphereOceanModel(Simulation(nest), ocean)`, exactly as in `downscale.jl` — the coupling
-# `downscale.jl`'s own header calls an untested code path. It is untested because NumericalEarth's
-# Breeze↔ESM interface (`thermodynamics_parameters`, `surface_layer_height`, `interpolate_state!`, …)
-# dispatches on `Breeze.AtmosphereModel` and `Simulation{<:Breeze.AtmosphereModel}`; a `NestedModel`
-# wrapping a Breeze child matches neither, and only `bulk_drag` is forwarded today. So on a checkout
-# without those forwards this throws a `MethodError`, and rather than stop there — the point of this
-# script is to reach the compiled step — we fall back loudly to stepping the bare nest, which is the
-# same atmosphere without Monin–Obukhov surface fluxes. `AR_COUPLED=0` skips the attempt entirely.
+# `AtmosphereOceanModel(Simulation(nest), ocean)`, exactly as in `downscale.jl`. This SUCCEEDS on the
+# current checkouts (job 6118) and is the configuration to run: it is the same atmosphere as the bare
+# nest plus Monin–Obukhov surface fluxes over the prescribed ocean.
 #
-# A checkout that DOES have the forwards (NumericalEarth `glw/cleanup` does) gets further and then
-# fails differently: `ComponentExchanger` asks Breeze for `surface_precipitation_flux`, which builds a
-# `Field(::KernelFunctionOperation)`, and that constructor eagerly `compute!`s it — the
-# `AbstractOperation`-on-a-`LatitudeLongitudeGrid` caveat up top, i.e. `InvalidIRError: unsupported
-# call to jl_f_throw_methoderror`. Same conclusion, different exception, so the fallback catches both.
-# `InvalidIRError` is matched by type NAME because it lives in GPUCompiler, which is not a direct
-# dependency of this project and so cannot be named here.
+# The `try` is still here because "does this NumericalEarth couple a `NestedModel` under Reactant" is
+# a property of the checkout, not of this script, and the point of the script is to reach the
+# compiled step. Three answers of "no" are on record and the predicate below matches all three:
+#
+#   * `MethodError`. NumericalEarth's Breeze↔ESM interface (`thermodynamics_parameters`,
+#     `surface_layer_height`, `interpolate_state!`, …) dispatches on `Breeze.AtmosphereModel` and
+#     `Simulation{<:Breeze.AtmosphereModel}`; a `NestedModel` wrapping a Breeze child matches
+#     neither. `pb/cleanup` forwards them; a checkout without the forwards does not.
+#   * `InvalidIRError`. `ComponentExchanger` asks Breeze for `surface_precipitation_flux`, which for
+#     the 1-moment scheme builds a `Field(::KernelFunctionOperation)`, and that constructor eagerly
+#     `compute!`s it. Fixed by Oceananigans b2ea52a84, which recomputes an operation's eltype from
+#     its ADAPTED operands instead of pinning the pre-adaptation type. Matched by type NAME because
+#     `InvalidIRError` lives in GPUCompiler, not a direct dependency of this project.
+#   * `ErrorException("Scalar indexing is disallowed")`. `PrescribedOcean`'s exchanger seeded its
+#     state with `interior(T) .= interior(fts)[:, :, :, 1]`; `interior` is a view, and `getindex` on
+#     a view falls back to Base's one-element-at-a-time Cartesian loop. Fixed in NumericalEarth's
+#     `copy_prescribed_time_level!`, which slices `parent(fts)` so the backend's own `getindex`
+#     handles it. This one fires FIRST — the ocean's exchanger is built before the atmosphere's — so
+#     while it stood, the `InvalidIRError` above was never even reached.
+#
+# `minrepro_coupled.jl` is the write-up. `AR_COUPLED=0` skips the attempt entirely, and
+# `AR_STOP_AFTER_COUPLING=1` (below) stops here, which is how to re-check coupling without paying
+# for the compile.
+#
+# ### The Monin–Obukhov solver has to run a FIXED number of iterations
+#
+# `SimilarityTheoryFluxes` defaults to `ConvergenceStopCriteria(1e-8, 100)`, which stops the
+# characteristic-scale fixed point when the drift in `(u★, θ★, q★)` falls below a tolerance. That is
+# a DATA-DEPENDENT trip count, and it lowers to an `scf.while` whose condition reads the iterate:
+#
+#     error: cannot raise op to stablehlo
+#     %149:6 = "scf.while"(…)                       ← julia_iterate_interface_fluxes_…
+#       … %477 = arith.addf(%476, %475) : f32       ← |Δu★| + |Δθ★| + |Δq★|
+#         %478 = arith.cmpf(%477, %21) …            ← < tolerance
+#
+# `raise-affine-to-stablehlo` cannot raise that (job 6125). `FixedIterations(n)` makes `iterating`
+# just `iteration < n`, a counted loop the raise handles — and it is what a differentiable version
+# needs anyway, since a convergence test is not something the reverse sweep can unroll either.
+#
+# `AR_FLUX_ITERATIONS` sets `n`, default 10. That is a physics knob, not a formality: the fixed point
+# converges in a handful of iterations over ocean under near-neutral conditions and more slowly in
+# strongly stable stratification, so a too-small `n` leaves the surface fluxes short of their
+# converged value. Raise it if the surface fluxes look wrong; each iteration costs one pass through
+# the similarity functions.
 #
 # Δt is fixed (no wizard inside the trace), at the clock's float type: keep `AR_DT` under the
 # advective CFL of whatever resolution `AR_CELLS_PER_DEGREE` selects. It is set back at shim 5, which
@@ -1772,12 +2085,27 @@ end
 
 atmosphere = Simulation(nest; Δt)
 
+# `Simulation` stores `Δt` in a TYPED field, converted with `TT = eltype(model)`, and
+# `time_step!(sim, Δt)` re-assigns that field on every call — so a `Simulation` whose `Δt` type is
+# wider than the model's silently widens the step back on each step. `Base.eltype(::NestedModel)`
+# (NumericalEarth) is what keeps this at the child's float type; without it the
+# `eltype(::AbstractModel) = Float64` fallback applies, and the resulting `Float64` `Δt` reaches
+# `tick_stage!` on a `TracedRNumber{Float32}` clock as a mixed-width `stablehlo.add` that fails MLIR
+# verification. Assert rather than trust: the failure is 30 minutes of compiling away from here.
+@assert typeof(atmosphere.Δt) === typeof(Δt) "Simulation stored Δt as $(typeof(atmosphere.Δt)) but \
+    the model steps at $(typeof(Δt)); eltype(nest) = $(eltype(nest)). A Float64 Δt against a Float32 \
+    traced clock does not compile — check `Base.eltype(::NestedModel)` in NumericalEarth."
+stage("simulation Δt: $(typeof(atmosphere.Δt)) (eltype(nest) = $(eltype(nest)))")
+
 # ## Attaching radiation to the BARE nest
 #
-# `AR_RADIATION=1` built an RTM above, but until now it was only ever handed to
-# `AtmosphereOceanModel` — and that call fails under Reactant (the `InvalidIRError` documented below),
-# so the run fell back to the bare nest and the RTM was silently DISCARDED. Every "radiation enabled"
-# run before this one differentiated a model with no radiation in it.
+# `AR_RADIATION=1` built an RTM above, and for a long time it was only ever handed to
+# `AtmosphereOceanModel` — which failed, so the run fell back to the bare nest and the RTM was
+# silently DISCARDED. Every "radiation enabled" run from that era differentiated a model with no
+# radiation in it. Coupling works now, so that is no longer the reason this block exists; it exists
+# so `AR_COUPLED=0` and any future fallback still get a radiatively active atmosphere. Materializing
+# here and then passing `radiation` to `AtmosphereOceanModel` as well is not a double application —
+# both routes alias the same `rtm.flux_divergence`.
 #
 # Radiation does not actually need the coupled model. Breeze's `update_state!` calls
 # `update_radiation!(model.radiation, model)` off the child's OWN field, and NumericalEarth's
@@ -1803,7 +2131,13 @@ end
 
 coupled_model = if get(ENV, "AR_COUPLED", "1") == "1"
     try
-        AtmosphereOceanModel(atmosphere, ocean; radiation, clock = model_clock)
+        flux_iterations = parse(Int, get(ENV, "AR_FLUX_ITERATIONS", "10"))
+        stage("atmosphere-ocean fluxes: SimilarityTheoryFluxes with FixedIterations($(flux_iterations)) \
+               — the default ConvergenceStopCriteria cannot be raised to StableHLO")
+        AtmosphereOceanModel(atmosphere, ocean; radiation, clock = traced_clock(),
+                             atmosphere_ocean_fluxes =
+                                 NumericalEarth.SimilarityTheoryFluxes(FT; solver_stop_criteria =
+                                     NumericalEarth.FixedIterations(flux_iterations)))
     catch err
         ## A THIRD failure mode appeared when Oceananigans was updated (job 5144): the exchanger's
         ## `PrescribedOcean` read now scalar-indexes a `ConcretePJRTArray`, which throws a plain
@@ -1824,13 +2158,25 @@ coupled_model = if get(ENV, "AR_COUPLED", "1") == "1"
                  needs (`MethodError`), or it has them and the exchanger's eager
                  `surface_precipitation_flux` computation does not compile under Reactant
                  (`InvalidIRError`). Stepping the bare nest instead (no surface fluxes); set
-                 AR_COUPLED=0 to skip this attempt.""" exception = err
+                 AR_COUPLED=0 to skip this attempt.""" exception = (err, catch_backtrace())
         nothing
     end
 end
 
 model = something(coupled_model, nest)
 stage(isnothing(coupled_model) ? "stepping the bare nest (uncoupled)" : "coupled model assembled")
+
+# `AR_STOP_AFTER_COUPLING=1`: exit here, before the first compile.
+#
+# The coupling attempt above is the last thing in this script that is CHEAP — everything after it is
+# the hours-long XLA compile. Working on the coupling itself means running the whole preamble (grid,
+# parent, nest, initial condition) and then throwing the compile away, so make that an explicit
+# option instead of a Ctrl-C. Exit status is 0 when the coupled model was built and 1 when it fell
+# back, so a batch job's status alone answers "does coupling work yet".
+if get(ENV, "AR_STOP_AFTER_COUPLING", "0") == "1"
+    stage("AR_STOP_AFTER_COUPLING=1: stopping before the compile")
+    exit(isnothing(coupled_model) ? 1 : 0)
+end
 
 # ## Compile and step
 #
@@ -1863,11 +2209,22 @@ stage(isnothing(coupled_model) ? "stepping the bare nest (uncoupled)" : "coupled
 #
 # The alternative fixes are upstream: parameterize that field in Breeze, or have Reactant skip
 # promotion for fields a struct cannot represent.
-function step_for!(model, Δt, Nsteps)
-    @trace track_numbers = false for _ = 1:Nsteps
-        time_step!(model, Δt)
+if VANILLA
+    ## No `@trace`: with no tracing context there is nothing to trace INTO, and the loop is just a
+    ## loop — `Nsteps` eager `time_step!`s, each launching its own kernels.
+    function step_for!(model, Δt, Nsteps)
+        for _ = 1:Nsteps
+            time_step!(model, Δt)
+        end
+        return nothing
     end
-    return nothing
+else
+    function step_for!(model, Δt, Nsteps)
+        @trace track_numbers = false for _ = 1:Nsteps
+            time_step!(model, Δt)
+        end
+        return nothing
+    end
 end
 
 steps = smoke ? 4 : parse(Int, get(ENV, "AR_STEPS", "100"))
@@ -1971,19 +2328,71 @@ ar_hlo_options(; kwargs...) =
 # column-major layout to XLA's, none of which the compiled executable would carry. Kernel LAUNCH
 # counts are unaffected by any of this, so those are the numbers to trust here.
 
-if get(ENV, "AR_HLO", "0") == "1"
+# ### `AR_HLO=optimized`: dump the StableHLO that XLA actually receives
+#
+# `AR_HLO=1` above is for reading what the step ASKS for; this mode is for handing the problem to
+# someone who does not have Julia. It runs Reactant's FULL pass pipeline — the raise included, so no
+# `enzymexla.kernel_call` survives and nothing Reactant-specific is left in the module — and writes
+# the result out just before it would have gone to `ClientCompileWithProto`. What comes back is plain
+# StableHLO: `hlo-opt`, `run_hlo_module` and friends can take it directly, with no Julia, no Reactant
+# and no libReactantExtra in the loop.
+#
+# That matters here because the expensive phase is downstream of everything Julia does. The coupled
+# `first_time_step!` has now spent 4 h 16 m (job 6287) and three separate 4 h+ attempts (job 6132) in
+# XLA/ptxas without finishing, against 45 min for a bare nest on a THREE TIMES LARGER grid (job 5142,
+# 108×54×50). Reproducing that from this script costs ~25 min of setup and a GPU node that keeps
+# failing under long jobs; reproducing it from this file costs one command.
+#
+# The two modes differ only in `optimize`, which is what gates the raise (see the section above), but
+# the cost is not symmetric: `optimize = false` is a trace, `optimize = true` is the whole pipeline —
+# minutes versus tens of minutes. Neither runs XLA codegen, which is the part that takes hours.
+#
+# ### Capturing XLA's own view as well
+#
+# StableHLO is XLA's INPUT. To see what XLA then does with it — which pass is eating the hours — set
+#
+#     XLA_FLAGS="--xla_dump_to=<dir> --xla_dump_hlo_pass_re=.*"
+#
+# on an ordinary run (no `AR_HLO`). XLA writes `module_XXXX.*.before_optimizations.txt` as soon as
+# compilation STARTS, so even a run killed at its walltime — which is how both coupled attempts have
+# ended so far — leaves behind the HLO reproducer plus per-pass dumps. `before_optimizations.txt` is
+# the other Julia-free entry point, and it is the one XLA's own bug reports want.
+
+hlo_mode = get(ENV, "AR_HLO", "0")
+
+if hlo_mode != "0"
     raise = true
-    hlo_path = get(ENV, "AR_HLO_PATH", raise ? "unopt_ar_raised.mlir" : "unopt_ar.mlir")
-    stage("tracing first_time_step! → unoptimized StableHLO (raise = $raise)")
+    optimized = hlo_mode in ("optimized", "opt", "all")
+
+    ## `optimize = true` selects `optimization_passes = true`, the full pipeline; `ar_hlo_options`
+    ## hardcodes `optimize = false`, so the optimized mode goes through `ar_compile_options` and
+    ## restates the `shardy_passes`/`strip` defaults `@code_hlo` would otherwise supply for itself.
+    options = optimized ?
+        ar_compile_options(raise = raise, optimize = true, shardy_passes = :none, strip = :none) :
+        ar_hlo_options(raise = raise)
+
+    default_path = optimized ? "stablehlo_ar_optimized.mlir" :
+                   raise ? "unopt_ar_raised.mlir" : "unopt_ar.mlir"
+    hlo_path = get(ENV, "AR_HLO_PATH", default_path)
+
+    stage("tracing first_time_step! → $(optimized ? "post-pipeline (raised) StableHLO — the module \
+           handed to XLA" : "unoptimized StableHLO") (raise = $raise)")
 
     trace_start = time_ns()
-    unoptimized_module = @code_hlo compile_options = ar_hlo_options(raise = raise) first_time_step!(
-        model, Δt)
-    stage(@sprintf("traced in %.1f s", 1e-9 * (time_ns() - trace_start)))
+    hlo_module = @code_hlo compile_options = options first_time_step!(model, Δt)
+    stage(@sprintf("%s in %.1f s", optimized ? "ran the pass pipeline" : "traced",
+                   1e-9 * (time_ns() - trace_start)))
 
-    write(hlo_path, repr(unoptimized_module))
+    write(hlo_path, repr(hlo_module))
     stage(@sprintf("wrote %s (%.1f MB) — stopping before the XLA compile", hlo_path,
                    filesize(hlo_path) / 1e6))
+
+    ## The module is tens of MB of text and compresses ~10×; the point of this mode is to hand the
+    ## file to someone else, so leave a copy that is small enough to attach to an issue.
+    if get(ENV, "AR_HLO_GZIP", "1") == "1"
+        run(pipeline(`gzip -9 -k -f $hlo_path`))
+        stage(@sprintf("also wrote %s.gz (%.1f MB)", hlo_path, filesize(hlo_path * ".gz") / 1e6))
+    end
     exit(0)
 end
 
@@ -2110,7 +2519,7 @@ function write_snapshot(path, model, iteration, t)
 end
 
 function report(model, wall_seconds)
-    bounds = @jit prognostic_bounds(model)
+    bounds = VANILLA ? prognostic_bounds(model) : @jit prognostic_bounds(model)
     iter = host_number(model.clock.iteration)
     t = host_number(model.clock.time)
     state = join([@sprintf("%s ∈ [%.4g, %.4g]%s", name, host_number(lo), host_number(hi),
@@ -2167,7 +2576,19 @@ prefer_while = get(ENV, "AR_PREFER_WHILE", "0") == "1"
 raise_passes = replace(DEFAULT_RAISE_PASSES,
                        "prefer_while_raising=false" => "prefer_while_raising=$(prefer_while)")
 
-raise_option = if get(ENV, "AR_SROA_INSTCOMBINE", "0") == "1"
+# `AR_RAISE=0` turns the raise OFF entirely: KernelAbstractions kernels stay as
+# `enzymexla.kernel_call`s and XLA executes them as custom calls around the CUDA kernels GPUCompiler
+# emits, instead of being lifted to StableHLO. This is a CONTROL, not a production setting — it is
+# how you ask "is a wrong answer the raise's fault?", because it runs the same model through a path
+# where the raise never touches it. Two consequences worth knowing:
+#   * The raise's failure modes cannot occur. No `llvm.alloca`, no `scf.while`, no traps to lift —
+#     so `AR_PARENT_UNIFORM_Z=0` (the true stretched ERA5 vertical) is reachable this way, which it
+#     is NOT with the raise on (job 6507: 225 `scf.while` + 123 `llvm.alloca`).
+#   * XLA sees opaque custom calls instead of real ops, so it cannot fuse across kernels. Expect a
+#     much cheaper compile and a slower step.
+raise_option = if get(ENV, "AR_RAISE", "1") == "0"
+    false
+elseif get(ENV, "AR_SROA_INSTCOMBINE", "0") == "1"
     "sroa-wrappers{instcombine=true instsimplify=true attributor=true},canonicalize," * raise_passes
 elseif prefer_while
     raise_passes
@@ -2176,6 +2597,7 @@ else
 end
 
 stage(string("raise passes: ",
+             raise_option === false ? "RAISE OFF (AR_RAISE=0) — kernels stay as enzymexla.kernel_call" :
              raise_option === true ? "Reactant default" : "custom",
              get(ENV, "AR_SROA_INSTCOMBINE", "0") == "1" ? " +leading-sroa-wrappers{instcombine=true}" : "",
              prefer_while ? " +prefer_while_raising=true" : "",
@@ -2740,20 +3162,31 @@ r_first_time_step! = if skip_first
     stage("SKIPPING first_time_step! compile (AR_SKIP_FIRST_STEP=1) — going straight to the traced loop")
     nothing
 else
-    stage("compiling first_time_step! ($(Nx)×$(Ny)×$(Nz) child, " *
-          "$(parent_Nx)×$(parent_Ny)×$(length(parent_pressure_levels)) parent)")
-    compile_start = time_ns()
-    f = @compile compile_options = ar_compile_options(raise = raise_option) first_time_step!(model, Δt)
-    stage(@sprintf("compiled first_time_step! in %.1f s", 1e-9 * (time_ns() - compile_start)))
-    f
+    if VANILLA
+        stage("first_time_step! will run EAGERLY (AR_ARCH=cuda) — no XLA compile")
+        first_time_step!
+    else
+        stage("compiling first_time_step! ($(Nx)×$(Ny)×$(Nz) child, " *
+              "$(parent_Nx)×$(parent_Ny)×$(length(parent_pressure_levels)) parent)")
+        compile_start = time_ns()
+        f = @compile compile_options = ar_compile_options(raise = raise_option) first_time_step!(model, Δt)
+        stage(@sprintf("compiled first_time_step! in %.1f s", 1e-9 * (time_ns() - compile_start)))
+        f
+    end
 end
 
-stage("compiling the $(chunk)-step traced loop ($(Nx)×$(Ny)×$(Nz) child, " *
-      "$(parent_Nx)×$(parent_Ny)×$(length(parent_pressure_levels)) parent)")
-compile_start = time_ns()
-r_step_for! = @compile compile_options = ar_compile_options(raise = raise_option) step_for!(
-    model, Δt, chunk)
-stage(@sprintf("compiled a %d-step traced loop in %.1f s", chunk, 1e-9 * (time_ns() - compile_start)))
+r_step_for! = if VANILLA
+    stage("the $(chunk)-step loop will run EAGERLY (AR_ARCH=cuda) — no XLA compile")
+    step_for!
+else
+    stage("compiling the $(chunk)-step traced loop ($(Nx)×$(Ny)×$(Nz) child, " *
+          "$(parent_Nx)×$(parent_Ny)×$(length(parent_pressure_levels)) parent)")
+    compile_start = time_ns()
+    f = @compile compile_options = ar_compile_options(raise = raise_option) step_for!(
+        model, Δt, chunk)
+    stage(@sprintf("compiled a %d-step traced loop in %.1f s", chunk, 1e-9 * (time_ns() - compile_start)))
+    f
+end
 
 worst_nonfinite = 0
 
