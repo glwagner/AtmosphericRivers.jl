@@ -1,0 +1,72 @@
+#!/bin/bash
+#SBATCH --job-name=ar-cuda-hydro-ab
+#SBATCH --partition=gpu-prod
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G
+#SBATCH --time=06:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# A/B test of the hydrostatic parent pressure (AR_PARENT_PRESSURE) on the hand-rolled ERA5 parent,
+# with Reactant taken out of the loop (AR_ARCH=cuda): same grid, same physics, same ERA5 initial
+# condition — the ONLY difference between the two runs is how the parent's pressure field is built.
+#
+#   A  AR_PARENT_PRESSURE=isa          the isothermal-288 K placeholder (the old behaviour)
+#   B  AR_PARENT_PRESSURE=hydrostatic  integrated from the parent's own mean virtual temperature
+#
+# Both write self-describing JLD2 snapshots (AR_CHUNK steps apart) that analysis/render_reactant_run.jl
+# and analysis/render_acoustic.jl turn into movies. No XLA compile anywhere in this job, so the wall
+# clock is dominated by the one-off precompile into the prod depot and the ~5 min ERA5 + nest setup.
+cd "$SLURM_SUBMIT_DIR"
+
+# Prod-only Julia depot, STACKED in front of the shared one (see slurm/reactant_era5_coupled_prod.batch):
+# the three node types write mutually incompatible native package images into `compiled/`, so give
+# sapphirerapids its own. packages/ and artifacts/ are still read from ~/.julia.
+export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
+mkdir -p "$HOME/.julia-prod"
+
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-16}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
+export HDF5_USE_FILE_LOCKING=FALSE   # NFS: HDF5 POSIX locks misbehave
+export TMPDIR="$SLURM_SUBMIT_DIR/reactant_dumps"
+mkdir -p "$TMPDIR"
+
+JULIA=~/.juliaup/bin/julia
+
+if [ "${AR_SKIP_SETUP:-0}" != "1" ]; then
+    echo "=== [$(date -Is)] instantiate + precompile ==="
+    $JULIA --startup-file=no --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' || exit 1
+fi
+
+run_one () {
+    local tag=$1 pressure=$2
+    echo "=== [$(date -Is)] run $tag: AR_PARENT_PRESSURE=$pressure ==="
+    AR_ARCH=cuda \
+    AR_DOMAIN=${AR_DOMAIN:-landfall} \
+    AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-9} \
+    AR_PARENT=era5 \
+    AR_PARENT_UNIFORM_Z=${AR_PARENT_UNIFORM_Z:-1} \
+    AR_PARENT_PRESSURE=$pressure \
+    AR_IC=interpolated \
+    AR_BALANCER=${AR_BALANCER:-0} \
+    AR_COUPLED=${AR_COUPLED:-1} \
+    AR_FLUX_ITERATIONS=${AR_FLUX_ITERATIONS:-10} \
+    AR_RADIATION=${AR_RADIATION:-1} \
+    AR_RADIATION_EVERY=${AR_RADIATION_EVERY:-360} \
+    AR_SOLAR_COS_ZENITH=${AR_SOLAR_COS_ZENITH:-0} \
+    AR_DT=${AR_DT:-10} \
+    AR_STEPS=${AR_STEPS:-720} \
+    AR_CHUNK=${AR_CHUNK:-30} \
+    AR_SPONGE=1 \
+    AR_OUTPUT=1 \
+    AR_OUTPUT_FILE=reactant_landfall_era5_9cpd_cuda_${tag}.jld2 \
+        stdbuf -oL -eL $JULIA --startup-file=no --project=. -t auto reactant_downscale.jl
+    local status=$?
+    echo "=== [$(date -Is)] run $tag done (exit $status) ==="
+    return $status
+}
+
+[ "${AR_RUN_A:-1}" = "1" ] && run_one isa isa
+[ "${AR_RUN_B:-1}" = "1" ] && run_one hydro hydrostatic
+
+echo "=== [$(date -Is)] all done ==="
