@@ -610,7 +610,11 @@ end
 ##    same footing as the configuration already known to work.
 ##
 ##    `AR_REFERENCE_STATE=1` restores the real call, for testing once upstream can trace it.
-if get(ENV, "AR_REFERENCE_STATE", "0") != "1"
+##    Not installed under `AR_ARCH=cuda`: nothing there is a Reactant grid, and the copied upstream
+##    body below is a drift hazard (it broke once when Breeze 0.11 renamed `surface_pressure` →
+##    `base_pressure` and added `ref.surface_pressure` to the call), so the control run should see
+##    Breeze's own method.
+if get(ENV, "AR_REFERENCE_STATE", "0") != "1" && !VANILLA
     @eval Breeze.CompressibleEquations function AtmosphereModels.reset_reference_state!(model::TerrainCompressibleModel)
         if Oceananigans.Architectures.architecture(model.grid) isa Oceananigans.Architectures.ReactantState
             @info "reset_reference_state!: SKIPPED on a Reactant grid — keeping the constructor's \
@@ -618,14 +622,16 @@ if get(ENV, "AR_REFERENCE_STATE", "0") != "1"
             return nothing
         end
 
-        ## Unmodified upstream body, so a CPU model still gets the real reference state.
+        ## Upstream body (Breeze 0.11, `terrain_compressible_physics.jl`), so a CPU model still gets
+        ## the real reference state. Re-check against upstream whenever Breeze moves.
         dynamics = model.dynamics
         ref = dynamics.reference_state
         ref === nothing && return nothing
 
         ref_spec = terrain_reference_mean_profiles(model)
-        compute_terrain_reference_state!(ref.pressure, ref.density, ref.exner_function, model.grid,
-                                         surface_pressure(dynamics),
+        compute_terrain_reference_state!(ref.pressure, ref.density, ref.exner_function,
+                                         ref.surface_pressure, model.grid,
+                                         base_pressure(dynamics),
                                          ref_spec,
                                          standard_pressure(dynamics),
                                          model.thermodynamic_constants)
@@ -1190,7 +1196,16 @@ parent_grid = LatitudeLongitudeGrid(arch;
                                     halo = (5, 5, 5),
                                     topology = (Bounded, Bounded, Bounded))
 
-parent_times = collect(0.0:1hour:2hours)    # three levels = the exchanger's window width
+# `AR_PARENT_HOURS` (default 2): hourly parent levels from `start_date`, so `AR_PARENT_HOURS + 1` time
+# levels. The default three ARE the exchanger's resident window, which is what lets shim 2 freeze the
+# window under Reactant. More levels are only meaningful under `AR_ARCH=cuda`, where the exchanger
+# slides its window eagerly exactly as in `downscale.jl`; under Reactant the window cannot move, so
+# a longer parent would still wrap after 2 h.
+parent_hours = parse(Int, get(ENV, "AR_PARENT_HOURS", "2"))
+(!VANILLA && parent_hours != 2) &&
+    @warn "AR_PARENT_HOURS=$parent_hours under Reactant: shim 2 pins the exchanger window, so the \
+           boundary forcing will still stop advancing after 2 h of model time"
+parent_times = collect(0.0:1hour:(parent_hours * 1hour))
 
 u_parent = FieldTimeSeries{Center, Center, Center}(parent_grid, parent_times)
 v_parent = FieldTimeSeries{Center, Center, Center}(parent_grid, parent_times)
@@ -1211,6 +1226,11 @@ set!(qᶜⁱ_parent, cloud_ice_specific_humidity)
 set!(qˢ_parent,  snow_specific_humidity)
 
 ## Pressure is the level coordinate — a static `Field`, exactly as the ERA5 parent carries it.
+##
+## This is a PLACEHOLDER: the isothermal-288 K map that also placed the levels. It is what
+## `AR_PARENT_PRESSURE=isa` runs with, and it is hydrostatically inconsistent with any temperature
+## field that is not 288.15 K everywhere — see the `AR_PARENT_PRESSURE` section below, which
+## overwrites this field in place once the parent's temperature is known.
 parent_pressure = CenterField(parent_grid)
 set!(parent_pressure, (λ, φ, z) -> isa_pressure(z))
 
@@ -1272,15 +1292,40 @@ parent_atmosphere = PrescribedAtmosphere(parent_grid, parent_times;
 # Regridding goes through `set!(cpu_dst, era5_src)` between two CPU fields, so Oceananigans' own
 # interpolation handles any grid mismatch — rather than an index-by-index copy that would silently
 # assume the two grids line up. Only then is the result pushed to the device, whole-parent.
-if get(ENV, "AR_PARENT", "analytic") == "era5"
-    era5_pad = parse(Float64, get(ENV, "AR_ERA5_PADDING", "0.5"))
-    era5_region = BoundingBox(longitude = longitude .+ (-era5_pad, era5_pad),
-                              latitude  = latitude  .+ (-era5_pad, era5_pad))
-    era5_dates = start_date:Hour(1):(start_date + Hour(2))
+## CPU twin of the parent grid built above. The ERA5 branch regrids onto it, and the hydrostatic
+## pressure below integrates along its (plain-number) vertical coordinate in either parent mode.
+cpu_parent_grid = LatitudeLongitudeGrid(CPU();
+                                        longitude = parent_λ,
+                                        latitude = parent_φ,
+                                        z = parent_z,
+                                        size = (parent_Nx, parent_Ny, length(parent_pressure_levels)),
+                                        halo = (5, 5, 5),
+                                        topology = (Bounded, Bounded, Bounded))
 
-    ## Metadata filenames encode the exact bounding box, so this padding must equal the one
-    ## `predownload.jl` used (the dataset default, 0.5°) or every read is a cache miss. The files
-    ## must already be present in `era5_datadir`.
+if get(ENV, "AR_PARENT", "analytic") == "era5"
+    ## The read box DEFAULTS TO THE PARENT'S OWN PADDING. With the old 0.5° default the parent grid
+    ## (padded 1°) extended half a degree past the ERA5 data on every side, and `set!` zero-filled
+    ## that frame — the "56 of 2736 zeros are INTERIOR" line in every ERA5 load, and the source of
+    ## the ρᵈ = 2.76 kg/m³ / θ = 126 K relaxation targets (real air interpolated against zeros).
+    ## The 1°-padded landfall box is in the cache alongside the 0.5° one.
+    era5_pad = parse(Float64, get(ENV, "AR_ERA5_PADDING", string(parent_padding)))
+    ## `AR_ERA5_REGION="lon1,lon2,lat1,lat2"` reads a DIFFERENT (larger) cached box instead of the
+    ## padded child box — the regrid below interpolates onto the parent grid either way. This is how
+    ## a longer window is reached without a CDS download: the corridor box
+    ## (-170.5,-109.5,24.5,60.5) is cached hourly for 12 h where the landfall box has only 3 levels.
+    era5_region = if haskey(ENV, "AR_ERA5_REGION")
+        r = parse.(Float64, split(ENV["AR_ERA5_REGION"], ','))
+        length(r) == 4 || error("AR_ERA5_REGION needs lon1,lon2,lat1,lat2")
+        BoundingBox(longitude = (r[1], r[2]), latitude = (r[3], r[4]))
+    else
+        BoundingBox(longitude = longitude .+ (-era5_pad, era5_pad),
+                    latitude  = latitude  .+ (-era5_pad, era5_pad))
+    end
+    era5_dates = start_date:Hour(1):(start_date + Hour(parent_hours))
+
+    ## Metadata filenames encode the exact bounding box, so this padding must match a box that was
+    ## actually downloaded or every read is a cache miss. The files must already be present in
+    ## `era5_datadir`.
     ##
     ## The `glw/cleanup` NumericalEarth now routes `PrescribedAtmosphere(dir=…)` through
     ## `download(::MetadataSet)`, whose per-`Metadata` method lives in the `CopernicusClimateDataStore`
@@ -1299,15 +1344,7 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
                                            dir = era5_datadir,
                                            time_indices_in_memory = nothing)
 
-    ## CPU twin of the parent grid built above — the regridding destination.
-    cpu_parent_grid = LatitudeLongitudeGrid(CPU();
-                                            longitude = parent_λ,
-                                            latitude = parent_φ,
-                                            z = parent_z,
-                                            size = (parent_Nx, parent_Ny, length(parent_pressure_levels)),
-                                            halo = (5, 5, 5),
-                                            topology = (Bounded, Bounded, Bounded))
-
+    ## `cpu_parent_grid` (defined above the branch) is the regridding destination.
     era5_sources = (u_parent   => era5_atmosphere.velocities.u,
                     v_parent   => era5_atmosphere.velocities.v,
                     T_parent   => era5_atmosphere.temperature,
@@ -1406,6 +1443,119 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
         stage("AR_PARENT_PROBE_ONLY=1 — stopping after the parent probe")
         exit(0)
     end
+end
+
+# ## `AR_PARENT_PRESSURE` (default `hydrostatic`): a parent pressure the parent's own temperature can hold up
+#
+# The placeholder above pairs every parent level with the pressure of an ISOTHERMAL 288.15 K column
+# at that height — the same map that placed the levels. The exchanger then forms the child's
+# boundary targets as ρ = p / (Rᵐ T) with the REAL temperature at that height, and Breeze diagnoses
+# the child's pressure back from (ρ, θ), so in the boundary zone the child's pressure IS p_iso(z).
+# Its vertical gradient balances a 288 K density; the target density belongs to air 40–70 K colder.
+# The net vertical force per unit mass is g (T / 288.15 − 1): about −0.3 m/s² near the surface and
+# −2.3 m/s² through the upper troposphere. That is the ρw ≈ −12 to −20 m/s "in one step" kick every
+# ERA5 run has shown, and — because the halos and Davies targets stay pinned to p_iso while the
+# interior settles into balance with its own temperature — a standing pressure jump of tens of hPa
+# across every lateral wall, radiating acoustic waves from t = 0. Same defect for the analytic
+# parent (6.5 K/km lapse rate against an isothermal pressure), only milder.
+#
+# The fix integrates the pressure HYDROSTATICALLY on the parent's own level heights from the
+# parent's own domain-mean virtual temperature, anchored at the domain-mean surface pressure. What
+# remains is the per-column anomaly T′/T̄ (a few percent), which is the same residual the native
+# `PressureLevelGrid` path carries, since its boundary interpolation also works on column-mean
+# heights. Nothing here depends on WHAT the heights are, so `AR_PARENT_UNIFORM_Z=1` and the raise's
+# arithmetic vertical index are unaffected.
+#
+# `AR_PARENT_PRESSURE=isa` keeps the isothermal placeholder, i.e. reproduces the old behaviour.
+if get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "hydrostatic"
+    let constants64 = Breeze.ThermodynamicConstants(Float64),
+        Rᵈ = Breeze.dry_air_gas_constant(constants64),
+        Rᵛ = Breeze.vapor_gas_constant(constants64),
+        Hz = Oceananigans.Grids.halo_size(cpu_parent_grid)[3],
+        Nk = length(parent_pressure_levels)
+
+        ## Whole (haloed) host copies of the t = 0 parent state; interior levels are Hz+1 : Hz+Nk.
+        Tʰ   = Array(parent(T_parent[1]))
+        qᵛʰ  = Array(parent(q_parent[1]))
+        qˡʰ  = Array(parent(qᶜˡ_parent[1])) .+ Array(parent(qʳ_parent[1]))
+        qⁱʰ  = Array(parent(qᶜⁱ_parent[1])) .+ Array(parent(qˢ_parent[1]))
+        Hx, Hy, _ = Oceananigans.Grids.halo_size(cpu_parent_grid)
+        ii = Hx+1:Hx+parent_Nx
+        jj = Hy+1:Hy+parent_Ny
+
+        ## Domain-mean "virtual" temperature per level, with the exchanger's own mixture gas
+        ## constant: ρ = p / (Rᵐ T) ⇔ ρ = p / (Rᵈ Tᵛ) with Tᵛ = T Rᵐ / Rᵈ. Only finite, physical
+        ## cells count, so a stray zero (unfilled corner, below-ground garbage) cannot bias the mean.
+        T̄ᵛ = zeros(Nk)
+        for k in 1:Nk
+            kk = Hz + k
+            acc = 0.0; n = 0
+            for j in jj, i in ii
+                T = Tʰ[i, j, kk]
+                (isfinite(T) && T > 100) || continue
+                Rᵐ = (1 - qᵛʰ[i, j, kk] - qˡʰ[i, j, kk] - qⁱʰ[i, j, kk]) * Rᵈ + qᵛʰ[i, j, kk] * Rᵛ
+                acc += T * Rᵐ / Rᵈ; n += 1
+            end
+            T̄ᵛ[k] = n > 0 ? acc / n : (k > 1 ? T̄ᵛ[k-1] : 288.15)
+        end
+
+        ## Surface anchor: the dataset's domain-mean surface pressure over the child at the start
+        ## date (the same number `nested_atmosphere_model(grid, dataset)` anchors its reference to);
+        ## the analytic parent, and an ERA5 cache without that file, fall back to `p_std`.
+        p_surface = p_std
+        if get(ENV, "AR_PARENT", "analytic") == "era5"
+            try
+                p_surface = Float64(breeze_extension.mean_surface_pressure(dataset, host_grid, start_date, era5_datadir))
+            catch err
+                @warn "hydrostatic parent pressure: could not read the ERA5 mean surface pressure; \
+                       anchoring at p_std = $(p_std) Pa instead" exception = (err, catch_backtrace())
+            end
+        end
+
+        ## Center heights INCLUDING halos, so the halo levels get a hydrostatic extrapolation rather
+        ## than a copied edge value. Integrate outward from z = 0 in both directions, using the
+        ## layer-mean Tᵛ of the nearest interior levels.
+        ## `znodes(...; with_halos = true)` is an offset-indexed view (1-Hz : Nk+Hz) over an offset
+        ## array; `collect`, comprehensions over `eachindex`, and `Vector(...)` all keep those axes.
+        ## Indexing over a plain integer range is what yields a 1-based vector.
+        zc_halo = znodes(cpu_parent_grid, Center(); with_halos = true)
+        zc_all = Float64[zc_halo[i] for i in firstindex(zc_halo):lastindex(zc_halo)]
+        Ktot = length(zc_all)
+        @assert Ktot == Nk + 2Hz
+        Tᵛ_at(kk) = T̄ᵛ[clamp(kk - Hz, 1, Nk)]
+        p_all = zeros(Ktot)
+        k₀ = Hz + 1                                            # first interior center
+        p_all[k₀] = p_surface * exp(-g_std * zc_all[k₀] / (Rᵈ * Tᵛ_at(k₀)))
+        for kk in k₀+1:Ktot
+            p_all[kk] = p_all[kk-1] * exp(-g_std * (zc_all[kk] - zc_all[kk-1]) /
+                                          (Rᵈ * 0.5 * (Tᵛ_at(kk-1) + Tᵛ_at(kk))))
+        end
+        for kk in k₀-1:-1:1
+            p_all[kk] = p_all[kk+1] * exp(+g_std * (zc_all[kk+1] - zc_all[kk]) /
+                                          (Rᵈ * 0.5 * (Tᵛ_at(kk+1) + Tᵛ_at(kk))))
+        end
+
+        ## What the placeholder had, for the log: its relative hydrostatic imbalance is exactly
+        ## Tᵛ/288.15 − 1 per level, and its pressure error is p_iso/p̄ − 1.
+        p_iso = isa_pressure.(zc_all)
+        worst_k = argmax(abs.(T̄ᵛ ./ 288.15 .- 1))
+        stage(@sprintf("hydrostatic parent pressure: anchored at p_surface = %.0f Pa; T̄ᵛ ∈ [%.1f, %.1f] K; \
+                        the isothermal placeholder was out of balance by up to %+.0f%% (level %d, %.0f m) \
+                        and off in pressure by up to %+.0f%% at the top interior level",
+                       p_surface, minimum(T̄ᵛ), maximum(T̄ᵛ),
+                       100 * (T̄ᵛ[worst_k] / 288.15 - 1), worst_k, zc_all[Hz + worst_k],
+                       100 * (p_iso[Hz + Nk] / p_all[Hz + Nk] - 1)))
+
+        ## Level-constant field, whole-parent (halos included), pushed to the device in one shot.
+        p_host = similar(Tʰ)
+        for kk in 1:Ktot
+            p_host[:, :, kk] .= eltype(p_host)(p_all[kk])
+        end
+        copyto!(parent(parent_pressure), p_host)
+    end
+else
+    stage("parent pressure: AR_PARENT_PRESSURE=isa — keeping the isothermal-288 K placeholder (hydrostatically \
+           inconsistent with the parent temperature; expect the acoustic kick from the walls)")
 end
 
 ## `summary(::PrescribedAtmosphere)` reduces over the grid's node vectors with `extrema`, which is
@@ -1540,7 +1690,11 @@ nested_time_discretization = SplitExplicitTimeDiscretization(FT;
                                                              sponge,
                                                              damping = NoDivergenceDamping())
 
-dynamics = CompressibleDynamics(nested_time_discretization; surface_pressure = p_std)
+## Breeze 0.11 renamed the anchor `surface_pressure` → `base_pressure` (the reference pressure at
+## z = 0; "surface pressure" now means the derived pressure at a column's ground). NumericalEarth's
+## `nested_atmosphere_model` still accepts `surface_pressure` and bridges it; direct
+## `CompressibleDynamics` calls must use the new name.
+dynamics = CompressibleDynamics(nested_time_discretization; base_pressure = p_std)
 
 ## `@allowscalar` because regularizing the `Interpolated` lateral boundaries calls
 ## `validate_source_bracket`, whose `extrema(xnodes(grid))` / `extrema(ynodes(grid))` reduce over the
@@ -1839,7 +1993,7 @@ elseif ic_mode === :interpolated
                                            surface_pressure = p_std,
                                            clock = Clock(time = zero(FT)),
                                            dynamics = CompressibleDynamics(nested_time_discretization;
-                                                                           surface_pressure = p_std),
+                                                                           base_pressure = p_std),
                                            bottom_drag_coefficient = twin_drag > 0 ? twin_drag : nothing,
                                            drag_surface_temperature = twin_drag > 0 ?
                                                parse(FT, get(ENV, "AR_DRAG_TSFC", "285")) : nothing,
