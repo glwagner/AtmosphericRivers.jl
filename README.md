@@ -22,6 +22,11 @@ corridor; the moisture traced back ~11,000 km to the western Pacific.
 
 ## Contents
 
+For a Julia-only, CPU-based movie of offshore development through landfall, see
+[`analysis/lifecycle`](analysis/lifecycle/README.md). It combines hourly 0.25°
+ERA5 over the dateline-spanning North Pacific with an optional existing 3 km,
+30-minute hindcast and exports a separate detailed landfall movie.
+
 | File | Purpose |
 |---|---|
 | `case.jl` | Shared configuration: dates, domain, resolution, data directory |
