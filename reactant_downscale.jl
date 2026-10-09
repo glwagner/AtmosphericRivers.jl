@@ -969,7 +969,7 @@ end
 # (default 2, as in `downscale.jl`) — done once on the host, so the Reactant path takes it too. The
 # same frame taper applies: the hand-rolled parent is flat, so the ground must reach 0 at the walls.
 # The ETOPO file must already be in NumericalEarth's scratchspace (~480 MB, downloaded otherwise).
-terrain_source = get(ENV, "AR_TERRAIN", "analytic")
+terrain_source = get(ENV, "AR_TERRAIN", "etopo")
 terrain_source in ("analytic", "etopo") || error("AR_TERRAIN must be analytic or etopo, got $(terrain_source)")
 
 if terrain_source == "etopo"
@@ -3480,7 +3480,7 @@ if get(ENV, "AR_AD", "0") == "1"
                 file["ad/sweep_seconds"]   = sweep_seconds
                 file["ad/compile_seconds"] = ad_compile_seconds
                 file["ad/loss_kind"]       = AD_LOSS
-                file["ad/terrain_source"]  = get(ENV, "AR_TERRAIN", "analytic")
+                file["ad/terrain_source"]  = get(ENV, "AR_TERRAIN", "etopo")
                 file["ad/terrain_smoothing_passes"] = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2"))
                 file["ad/dt"]              = Float64(Δt)
                 file["ad/control_value"]   = Array(host_interior(control))
