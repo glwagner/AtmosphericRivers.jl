@@ -960,6 +960,34 @@ taper_degrees = terrain_blend_length / 111e3
     return coastal + cascades + interior
 end
 
+# ## `AR_TERRAIN=etopo`: real orography
+#
+# The ridges above are straight north–south bumps: the Coast Range at -123.9°, the Cascades at
+# -121.3°, no Olympics, no Willapa Hills, no Columbia Gorge. Fine for a configuration twin, wrong for
+# anything that cares WHERE rain falls. `AR_TERRAIN=etopo` instead regrids ETOPO2022 onto the child's
+# cell centres (land only, ocean → 0) and smooths it with `AR_TERRAIN_SMOOTHING` binomial passes
+# (default 2, as in `downscale.jl`) — done once on the host, so the Reactant path takes it too. The
+# same frame taper applies: the hand-rolled parent is flat, so the ground must reach 0 at the walls.
+# The ETOPO file must already be in NumericalEarth's scratchspace (~480 MB, downloaded otherwise).
+terrain_source = get(ENV, "AR_TERRAIN", "analytic")
+terrain_source in ("analytic", "etopo") || error("AR_TERRAIN must be analytic or etopo, got $(terrain_source)")
+
+if terrain_source == "etopo"
+    etopo_grid = LatitudeLongitudeGrid(CPU(); longitude, latitude, size = (Nx, Ny), halo = (5, 5),
+                                       topology = (Bounded, Bounded, Flat))
+    etopo_field = regrid_topography(etopo_grid; dataset = ETOPO2022())
+    smooth_topography!(etopo_field; passes = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2")))
+    const etopo_elevation = Array(interior(etopo_field, :, :, 1))
+    ## Nearest cell centre: every caller (materialize_terrain!, the SST land mask) evaluates at
+    ## centres of this same grid, so this is exact there.
+    @inline function orography(λ, φ)
+        i = clamp(round(Int, (λ - λ₁) / Δ + 0.5), 1, Nx)
+        j = clamp(round(Int, (φ - φ₁) / Δ + 0.5), 1, Ny)
+        return @inbounds etopo_elevation[i, j]
+    end
+    @info @sprintf("AR_TERRAIN=etopo: ETOPO2022 on the child grid, max %.0f m", maximum(etopo_elevation))
+end
+
 @inline function terrain_elevation(λ, φ)
     wall_distance = min(λ - λ₁, λ₂ - λ, φ - φ₁, φ₂ - φ)
     s = clamp(wall_distance / taper_degrees, 0, 1)
@@ -2285,6 +2313,11 @@ atmosphere = Simulation(nest; Δt)
 # `eltype(::AbstractModel) = Float64` fallback applies, and the resulting `Float64` `Δt` reaches
 # `tick_stage!` on a `TracedRNumber{Float32}` clock as a mixed-width `stablehlo.add` that fails MLIR
 # verification. Assert rather than trust: the failure is 30 minutes of compiling away from here.
+## Oceananigans 0.113's `Simulation(::ReactantModel)` stores `Δt = Float64(Δt)` unconditionally. Only
+## the coupled path steps through `time_step!(sim, sim.Δt)`; the bare nest (and the AD path, which
+## calls `time_step!(model, Δt)` with the script's own `Δt`) never reads it, so the mismatch only
+## matters when coupling is requested.
+typeof(atmosphere.Δt) === typeof(Δt) || get(ENV, "AR_COUPLED", "1") != "1" ||
 @assert typeof(atmosphere.Δt) === typeof(Δt) "Simulation stored Δt as $(typeof(atmosphere.Δt)) but \
     the model steps at $(typeof(Δt)); eltype(nest) = $(eltype(nest)). A Float64 Δt against a Float32 \
     traced clock does not compile — check `Base.eltype(::NestedModel)` in NumericalEarth."
