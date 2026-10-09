@@ -1,23 +1,23 @@
 #!/bin/bash
 #SBATCH --job-name=ar-cuda-hydro-long
-#SBATCH --partition=gpu-prod
+#SBATCH --partition=gpuprod
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=200G
 #SBATCH --time=06:00:00
 #SBATCH --output=slurm/%x-%j.log
 
 # The hydrostatic-parent configuration (AR_PARENT_PRESSURE=hydrostatic) run for AR_PARENT_HOURS of
 # real ERA5 forcing with Reactant out of the loop, twice: DFI balancer off, then on. The ERA5 read
-# comes from the cached CORRIDOR box, which holds 12 hourly levels from 2025-12-07T12; the landfall
+# comes from the cached CORRIDOR box, which holds 72 h of hourly levels from 2025-12-07T12; the landfall
 # box only has three. The parent grid itself is unchanged (landfall box + 1° padding); the read is
 # regridded onto it.
 cd "$SLURM_SUBMIT_DIR"
 
 export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
 mkdir -p "$HOME/.julia-prod"
-export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-16}
-export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
 export HDF5_USE_FILE_LOCKING=FALSE
 export TMPDIR="$SLURM_SUBMIT_DIR/reactant_dumps"
 mkdir -p "$TMPDIR"
@@ -30,11 +30,14 @@ if [ "${AR_SKIP_SETUP:-0}" != "1" ]; then
 fi
 
 HOURS=${AR_PARENT_HOURS:-12}
-STEPS=$(( HOURS * 3600 / ${AR_DT:-10} ))
+# Simulated length; defaults to the whole parent window. Set AR_RUN_HOURS one hour short of
+# AR_PARENT_HOURS to keep the exchanger's resident window off the last cached level.
+RUN_HOURS=${AR_RUN_HOURS:-$HOURS}
+STEPS=$(( RUN_HOURS * 3600 / ${AR_DT:-10} ))
 
 run_one () {
     local tag=$1 balancer=$2
-    echo "=== [$(date -Is)] run $tag: hydrostatic parent, ${HOURS} h, AR_BALANCER=$balancer, $STEPS steps ==="
+    echo "=== [$(date -Is)] run $tag: hydrostatic parent, ${RUN_HOURS} h of a ${HOURS} h parent, AR_BALANCER=$balancer, $STEPS steps ==="
     AR_ARCH=cuda \
     AR_DOMAIN=${AR_DOMAIN:-landfall} \
     AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-9} \
@@ -55,7 +58,7 @@ run_one () {
     AR_CHUNK=${AR_CHUNK:-90} \
     AR_SPONGE=1 \
     AR_OUTPUT=1 \
-    AR_OUTPUT_FILE=reactant_landfall_era5_9cpd_cuda_hydro_${HOURS}h_${tag}.jld2 \
+    AR_OUTPUT_FILE=reactant_landfall_era5_9cpd_cuda_hydro_${RUN_HOURS}h_dt${AR_DT:-10}${AR_TERRAIN:+_$AR_TERRAIN}_${tag}.jld2 \
         stdbuf -oL -eL $JULIA --startup-file=no --project=. -t auto reactant_downscale.jl
     local status=$?
     echo "=== [$(date -Is)] run $tag done (exit $status) ==="
