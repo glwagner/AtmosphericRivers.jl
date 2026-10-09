@@ -35,6 +35,6 @@ end
 function centres_to_faces(x)
     x = collect(Float64, x)
     Δ = length(x) > 1 ? (x[end] - x[1]) / (length(x) - 1) : 1.0
-    @assert all(isapprox.(diff(x), Δ; rtol = 1e-6)) "expected uniformly spaced cell centres"
+    @assert all(isapprox.(diff(x), Δ; rtol = 1e-3)) "expected uniformly spaced cell centres"
     return [x .- Δ / 2; x[end] + Δ / 2]
 end

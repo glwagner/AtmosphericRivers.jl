@@ -3046,6 +3046,57 @@ if get(ENV, "AR_AD", "0") == "1"
     control  = like(ad_prognostic)
     dcontrol = like(ad_prognostic)
 
+    ## ### `AR_AD_LOSS=precipitation`: accumulated surface precipitation over a region
+    ##
+    ## J = Σᵢⱼ wᵢⱼ Σₙ Δt Fᵢⱼ(tₙ) over the steps n > `AR_AD_ACCUM_START`, where F is Breeze's
+    ## `bottom_precipitation_flux` (kg m⁻² s⁻¹, positive down: the bottom-face flux of every
+    ## sedimenting condensate) evaluated after each `time_step!`. The weights w come from
+    ## `precipitation_weights(λ, φ, h)` in `AR_AD_LOSS_FILE` (default `sensitivity/loss.jl`), called once
+    ## on the host with the child's cell-centre longitudes, latitudes and terrain height; normalised
+    ## weights make J a region-mean accumulation in mm.
+    ##
+    ## Everything the loss needs beyond the model rides in `aux`, passed `Duplicated` so that the
+    ## accumulation buffer is a traced, mutable argument. A bonus of that: Enzyme's shadow of the
+    ## weights comes back as ∂J/∂w = the accumulated precipitation itself.
+    const AD_LOSS = get(ENV, "AR_AD_LOSS", "meansquare")
+    const PRECIPITATION_LOSS = AD_LOSS in ("precip", "precipitation")
+    PRECIPITATION_LOSS || AD_LOSS == "meansquare" ||
+        error("AR_AD_LOSS=$(AD_LOSS): use `meansquare` or `precipitation`")
+
+    ad_aux = if PRECIPITATION_LOSS
+        loss_file = get(ENV, "AR_AD_LOSS_FILE", joinpath(@__DIR__, "sensitivity", "loss.jl"))
+        include(loss_file)
+        λc = Array(λnodes(host_grid, Center(), Center(), Center()))
+        φc = Array(φnodes(host_grid, Center(), Center(), Center()))
+        Hx, Hy, _ = Oceananigans.Grids.halo_size(host_grid)
+        Nxh, Nyh, _ = size(host_grid)
+        hc = Array(parent(host_grid.z.formulation.h))[Hx+1:Hx+Nxh, Hy+1:Hy+Nyh, 1]
+        ## Two accepted contracts: `precipitation_weights(λ, φ, h)` on cell centres, or
+        ## sensitivity/region.jl's `region_weights(λ_faces, φ_faces) -> (w, area)`.
+        w = if isdefined(@__MODULE__, :precipitation_weights)
+            Base.invokelatest(precipitation_weights, Float64.(λc), Float64.(φc), Float64.(hc))
+        else
+            λf = Array(λnodes(host_grid, Face(), Center(), Center()))
+            φf = Array(φnodes(host_grid, Center(), Face(), Center()))
+            first(Base.invokelatest(region_weights, Float64.(λf), Float64.(φf)))
+        end
+        size(w) == (Nxh, Nyh) || error("precipitation_weights returned $(size(w)), expected $((Nxh, Nyh))")
+        all(isfinite, w) || error("precipitation_weights returned non-finite weights")
+
+        weights_field = Field{Center, Center, Nothing}(grid)
+        host_weights = zeros(FT, size(parent(weights_field)))
+        view(host_weights, parentindices(interior(weights_field))...) .= reshape(FT.(w), Nxh, Nyh, 1)
+        copyto!(parent(weights_field), host_weights)
+
+        stage(@sprintf("AD: precipitation loss from %s — %d columns weighted, Σw = %.4g",
+                       loss_file, count(!iszero, w), sum(w)))
+        (; accumulated = Field{Center, Center, Nothing}(grid),
+           weights = weights_field,
+           start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))))
+    else
+        nothing
+    end
+
     ## ### The opening step runs OUTSIDE the differentiated region
     ##
     ## Without Breeze's Euler-ish `first_time_step!` the trajectory enters RK3 straight from the
@@ -3110,57 +3161,6 @@ if get(ENV, "AR_AD", "0") == "1"
     ## trajectory exactly. Host round trip rather than a device-to-device broadcast: `Array(parent(·))`
     ## then a host→device `copyto!` is the direction Reactant specializes (shim 6's note).
     copyto!(parent(control), Array(parent(ad_prognostic)))
-
-    ## ### `AR_AD_LOSS=precipitation`: accumulated surface precipitation over a region
-    ##
-    ## J = Σᵢⱼ wᵢⱼ Σₙ Δt Fᵢⱼ(tₙ) over the steps n > `AR_AD_ACCUM_START`, where F is Breeze's
-    ## `bottom_precipitation_flux` (kg m⁻² s⁻¹, positive down: the bottom-face flux of every
-    ## sedimenting condensate) evaluated after each `time_step!`. The weights w come from
-    ## `precipitation_weights(λ, φ, h)` in `AR_AD_LOSS_FILE` (default `sensitivity/loss.jl`), called once
-    ## on the host with the child's cell-centre longitudes, latitudes and terrain height; normalised
-    ## weights make J a region-mean accumulation in mm.
-    ##
-    ## Everything the loss needs beyond the model rides in `aux`, passed `Duplicated` so that the
-    ## accumulation buffer is a traced, mutable argument. A bonus of that: Enzyme's shadow of the
-    ## weights comes back as ∂J/∂w = the accumulated precipitation itself.
-    const AD_LOSS = get(ENV, "AR_AD_LOSS", "meansquare")
-    const PRECIPITATION_LOSS = AD_LOSS in ("precip", "precipitation")
-    PRECIPITATION_LOSS || AD_LOSS == "meansquare" ||
-        error("AR_AD_LOSS=$(AD_LOSS): use `meansquare` or `precipitation`")
-
-    ad_aux = if PRECIPITATION_LOSS
-        loss_file = get(ENV, "AR_AD_LOSS_FILE", joinpath(@__DIR__, "sensitivity", "loss.jl"))
-        include(loss_file)
-        λc = Array(λnodes(host_grid, Center(), Center(), Center()))
-        φc = Array(φnodes(host_grid, Center(), Center(), Center()))
-        Hx, Hy, _ = Oceananigans.Grids.halo_size(host_grid)
-        Nxh, Nyh, _ = size(host_grid)
-        hc = Array(parent(host_grid.z.formulation.h))[Hx+1:Hx+Nxh, Hy+1:Hy+Nyh, 1]
-        ## Two accepted contracts: `precipitation_weights(λ, φ, h)` on cell centres, or
-        ## sensitivity/region.jl's `region_weights(λ_faces, φ_faces) -> (w, area)`.
-        w = if isdefined(@__MODULE__, :precipitation_weights)
-            Base.invokelatest(precipitation_weights, Float64.(λc), Float64.(φc), Float64.(hc))
-        else
-            λf = Array(λnodes(host_grid, Face(), Center(), Center()))
-            φf = Array(φnodes(host_grid, Center(), Face(), Center()))
-            first(Base.invokelatest(region_weights, Float64.(λf), Float64.(φf)))
-        end
-        size(w) == (Nxh, Nyh) || error("precipitation_weights returned $(size(w)), expected $((Nxh, Nyh))")
-        all(isfinite, w) || error("precipitation_weights returned non-finite weights")
-
-        weights_field = Field{Center, Center, Nothing}(grid)
-        host_weights = zeros(FT, size(parent(weights_field)))
-        view(host_weights, parentindices(interior(weights_field))...) .= reshape(FT.(w), Nxh, Nyh, 1)
-        copyto!(parent(weights_field), host_weights)
-
-        stage(@sprintf("AD: precipitation loss from %s — %d columns weighted, Σw = %.4g",
-                       loss_file, count(!iszero, w), sum(w)))
-        (; accumulated = Field{Center, Center, Nothing}(grid),
-           weights = weights_field,
-           start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))))
-    else
-        nothing
-    end
 
     ad_checkpointing() = AD_CHECKPOINT_BUDGET < 0 ? true :
                          AD_CHECKPOINT_BUDGET == 0 ? false :
