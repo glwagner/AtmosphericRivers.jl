@@ -1,0 +1,81 @@
+#!/bin/bash
+#SBATCH --job-name=ar-sens
+#SBATCH --partition=gpuprod
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
+#SBATCH --time=12:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Reverse-mode precipitation sensitivity through the compiled nest (AR_AD=1, AR_AD_LOSS=precipitation
+# in reactant_downscale.jl):
+#
+#     J = Σ w · ∫ bottom_precipitation_flux dt     (weights from sensitivity/loss.jl)
+#     ∂J/∂ρqᵉ at the state one step after the ERA5 initial condition
+#
+# AR_AD_STEPS is a comma list of window lengths: ONE compile serves all of them (traced trip count).
+# AR_PARENT_HOURS must cover the longest window (shim 2b holds the whole parent axis resident).
+#
+# Host memory is deliberately generous: the reverse sweep's first execution was SIGKILLed by the
+# host OOM killer at 28 GB on the old cluster (REACTANT_AD_REPORT.md §5.4).
+#
+#   sbatch slurm/reactant_sensitivity.batch                                    # defaults below
+#   sbatch --export=ALL,AR_AD_STEPS=720,AR_PARENT_HOURS=3 slurm/reactant_sensitivity.batch
+cd "$SLURM_SUBMIT_DIR"
+
+export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
+export HDF5_USE_FILE_LOCKING=FALSE
+export TMPDIR="$SLURM_SUBMIT_DIR/reactant_dumps"
+mkdir -p "$TMPDIR"
+
+# XLA: the persistent per-fusion autotune cache amortises the ~2400 s first-call warmup across jobs
+# (REACTANT_AD_REPORT.md §4); AR_XLA_AUTOTUNE_LEVEL=0 turns autotuning off entirely.
+AUTOTUNE_CACHE="$SLURM_SUBMIT_DIR/xla_autotune_cache"
+mkdir -p "$AUTOTUNE_CACHE"
+XLA_EXTRA="--xla_gpu_per_fusion_autotune_cache_dir=$AUTOTUNE_CACHE"
+[ -n "${AR_XLA_AUTOTUNE_LEVEL:-}" ] && XLA_EXTRA="$XLA_EXTRA --xla_gpu_autotune_level=$AR_XLA_AUTOTUNE_LEVEL"
+# H100-only hang workaround (§3.4); harmless elsewhere, so on by default.
+[ "${AR_XLA_NO_MOF:-1}" = "1" ] && XLA_EXTRA="$XLA_EXTRA --xla_disable_hlo_passes=multi_output_fusion"
+export XLA_FLAGS="${XLA_FLAGS:-} $XLA_EXTRA"
+
+JULIA=~/.juliaup/bin/julia
+
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+nproc; free -g | head -2
+
+if [ "${AR_SKIP_SETUP:-1}" != "1" ]; then
+    echo "=== [$(date -Is)] instantiate + precompile ==="
+    $JULIA --startup-file=no --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' || exit 1
+fi
+
+DT=${AR_DT:-10}
+echo "=== [$(date -Is)] AD run ==="
+echo "XLA_FLAGS=$XLA_FLAGS"
+
+AR_AD=1 \
+AR_AD_LOSS=${AR_AD_LOSS:-precipitation} \
+AR_AD_LOSS_FILE=${AR_AD_LOSS_FILE:-sensitivity/loss.jl} \
+AR_AD_CONTROL=${AR_AD_CONTROL:-moisture} \
+AR_AD_STEPS=${AR_AD_STEPS:-128,256,512,720} \
+AR_AD_ACCUM_START=${AR_AD_ACCUM_START:-0} \
+AR_AD_CHECKPOINTS=${AR_AD_CHECKPOINTS:-4} \
+AR_BACKEND=gpu \
+AR_DOMAIN=${AR_DOMAIN:-landfall} \
+AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-3} \
+AR_PARENT=era5 \
+AR_PARENT_HOURS=${AR_PARENT_HOURS:-3} \
+AR_PARENT_UNIFORM_Z=1 \
+AR_PARENT_PRESSURE=hydrostatic \
+AR_IC=interpolated \
+AR_COUPLED=${AR_COUPLED:-0} \
+AR_RADIATION=${AR_RADIATION:-0} \
+AR_SPONGE=${AR_SPONGE:-1} \
+AR_DT=$DT \
+AR_OUTPUT=1 \
+    stdbuf -oL -eL $JULIA --startup-file=no --project=. -t auto reactant_downscale.jl
+status=$?
+
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status

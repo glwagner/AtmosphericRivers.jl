@@ -1202,10 +1202,29 @@ parent_grid = LatitudeLongitudeGrid(arch;
 # slides its window eagerly exactly as in `downscale.jl`; under Reactant the window cannot move, so
 # a longer parent would still wrap after 2 h.
 parent_hours = parse(Int, get(ENV, "AR_PARENT_HOURS", "2"))
-(!VANILLA && parent_hours != 2) &&
-    @warn "AR_PARENT_HOURS=$parent_hours under Reactant: shim 2 pins the exchanger window, so the \
-           boundary forcing will still stop advancing after 2 h of model time"
 parent_times = collect(0.0:1hour:(parent_hours * 1hour))
+
+# ### Shim 2b: under Reactant, make the exchanger's resident window the WHOLE parent time axis
+#
+# Shim 2 freezes the exchanger window because a traced clock cannot decide when to slide it. With
+# NumericalEarth's default 3-level window that froze the boundary forcing after 2 h. A window that
+# holds every level never moves (`exchange_state!` pins `start = 1` when `window ≥ N`), and is filled
+# once at construction (`force = true`, eager), so freezing it is then EXACT for any run within
+# `AR_PARENT_HOURS`. The cost is memory: 8 derived fields × (AR_PARENT_HOURS + 1) levels on the parent
+# grid — ~1 GB for 24 h over the 1°-padded landfall box at 0.25°.
+if !VANILLA && parent_hours > 2
+    @eval breeze_extension function child_prognostic_field_time_series(parent_atmosphere; time_indices_in_memory = 3)
+        grid  = parent_atmosphere.temperature.grid
+        times = parent_atmosphere.temperature.times
+        window = length(times)
+        build() = FieldTimeSeries{Center, Center, Center}(grid, times;
+                                                          backend = PrognosticStateBackend(1, window),
+                                                          time_indexing = Cyclical())
+        return (ρᵈ = build(), ρu = build(), ρv = build(), ρθ = build(), ρqᵛᵉ = build(), θ = build(), u = build(), v = build())
+    end
+    @info "shim 2b: exchanger window = all $(length(parent_times)) parent levels ($(parent_hours) h of \
+           forcing); runs longer than that see the forcing clamp at the last level"
+end
 
 u_parent = FieldTimeSeries{Center, Center, Center}(parent_grid, parent_times)
 v_parent = FieldTimeSeries{Center, Center, Center}(parent_grid, parent_times)
@@ -1312,7 +1331,7 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
     ## `AR_ERA5_REGION="lon1,lon2,lat1,lat2"` reads a DIFFERENT (larger) cached box instead of the
     ## padded child box — the regrid below interpolates onto the parent grid either way. This is how
     ## a longer window is reached without a CDS download: the corridor box
-    ## (-170.5,-109.5,24.5,60.5) is cached hourly for 12 h where the landfall box has only 3 levels.
+    ## (-170.5,-109.5,24.5,60.5) is cached hourly for 72 h (Dec 7 12Z to Dec 10 12Z) where the landfall box has only 3 levels.
     era5_region = if haskey(ENV, "AR_ERA5_REGION")
         r = parse.(Float64, split(ENV["AR_ERA5_REGION"], ','))
         length(r) == 4 || error("AR_ERA5_REGION needs lon1,lon2,lat1,lat2")
@@ -2389,6 +2408,7 @@ if VANILLA
     function step_for!(model, Δt, Nsteps)
         for _ = 1:Nsteps
             time_step!(model, Δt)
+            accumulate_precipitation!(Δt)
         end
         return nothing
     end
@@ -2576,6 +2596,20 @@ end
 breeze_child(nest::NestedModel) = nest.child
 breeze_child(coupled) = coupled.atmosphere.model.child
 
+# Surface precipitation accumulated every step (kg m⁻², i.e. mm of liquid water), from Breeze's
+# `bottom_precipitation_flux` — the bottom-face flux of every sedimenting condensate, so rain and
+# snow alike. CUDA path only: the snapshots carry the running total, and differencing two of them
+# gives the accumulation over any window. Under Reactant the traced loop is left untouched.
+if VANILLA
+    const precipitation_flux = Breeze.bottom_precipitation_flux(breeze_child(model))
+    const accumulated_precipitation = Field{Center, Center, Nothing}(breeze_child(model).grid)
+    function accumulate_precipitation!(Δt)
+        compute!(precipitation_flux)
+        parent(accumulated_precipitation) .+= Δt .* parent(precipitation_flux)
+        return nothing
+    end
+end
+
 function prognostic_bounds(model)
     fields = prognostic_fields(breeze_child(model))
     ## The non-finite COUNT is the load-bearing number, not the bounds. `minimum`/`maximum` lower to
@@ -2669,9 +2703,24 @@ function write_grid_metadata(path)
         file["meta/balancer"]          = get(ENV, "AR_BALANCER", "0") == "1"
         file["meta/reference_state_recomputed"] = get(ENV, "AR_REFERENCE_STATE", "0") == "1"
         file["meta/note"] = "Prognostic fields at their native staggered locations (see " *
-                            "<name>/location). Interiors only, halos excluded. The parent is the " *
-                            "script's ANALYTIC atmospheric river, not ERA5 data read from disk."
+                            "<name>/location). Interiors only, halos excluded. The parent is " *
+                            (get(ENV, "AR_PARENT", "analytic") == "era5" ?
+                             "ERA5 hourly pressure-level data read from disk." :
+                             "the script's ANALYTIC atmospheric river, not ERA5 data.")
+        file["meta/parent"]            = get(ENV, "AR_PARENT", "analytic")
+        file["meta/start_date"]        = string(start_date)
     end
+    return nothing
+end
+
+## Physical heights and cell volumes of the terrain-following child, evaluated with the grid's own
+## `znode`/`Vᶜᶜᶜ` on the host twin, so a reader never has to reimplement the terrain formulation.
+function write_physical_heights(file)
+    Nx, Ny, Nz = size(host_grid)
+    c, f = Center(), Face()
+    file["grid/z_physical_center"] = [Oceananigans.Grids.znode(i, j, k, host_grid, c, c, c) for i in 1:Nx, j in 1:Ny, k in 1:Nz]
+    file["grid/z_physical_face"]   = [Oceananigans.Grids.znode(i, j, k, host_grid, c, c, f) for i in 1:Nx, j in 1:Ny, k in 1:Nz+1]
+    file["grid/cell_volume"]       = [Oceananigans.Operators.Vᶜᶜᶜ(i, j, k, host_grid) for i in 1:Nx, j in 1:Ny, k in 1:Nz]
     return nothing
 end
 
@@ -2683,6 +2732,11 @@ function write_snapshot(path, model, iteration, t)
             file["timeseries/$name/$iteration"] = Array(host_interior(f))
             key = "location/$name"
             haskey(file, key) || (file[key] = location_name(f))
+        end
+        if VANILLA
+            file["timeseries/precipitation_flux/$iteration"] = Array(host_interior(precipitation_flux))[:, :, 1]
+            file["timeseries/accumulated_precipitation/$iteration"] =
+                Array(host_interior(accumulated_precipitation))[:, :, 1]
         end
         ## No separate iteration index: it would have to be deleted and rewritten on every
         ## snapshot, and a run killed mid-rewrite would leave the file inconsistent with its own
@@ -2913,6 +2967,9 @@ if get(ENV, "AR_AD", "0") == "1"
     ad_step_list = [parse(Int, x) for x in split(get(ENV, "AR_AD_STEPS", "2"), ',') if !isempty(strip(x))]
     smoke && (ad_step_list = [2])
     const AD_CHECKPOINT_BUDGET = parse(Int, get(ENV, "AR_AD_CHECKPOINTS", "4"))
+    ## `AR_AD_RAISE_FIRST=0` re-tests whether the raise-before-Enzyme ordering is still required
+    ## (REACTANT_AD_REPORT.md §4: it predates the union fix and may be a large share of the compile).
+    const AD_RAISE_FIRST = get(ENV, "AR_AD_RAISE_FIRST", "1") == "1"
 
     ## Compiled against this ARGUMENT's type, not its value — so a fresh `ConcreteRNumber` with a
     ## different step count reuses the same executable.
@@ -2972,6 +3029,77 @@ if get(ENV, "AR_AD", "0") == "1"
     ## then a host→device `copyto!` is the direction Reactant specializes (shim 6's note).
     copyto!(parent(control), Array(parent(ad_prognostic)))
 
+    ## ### `AR_AD_LOSS=precipitation`: accumulated surface precipitation over a region
+    ##
+    ## J = Σᵢⱼ wᵢⱼ Σₙ Δt Fᵢⱼ(tₙ) over the steps n > `AR_AD_ACCUM_START`, where F is Breeze's
+    ## `bottom_precipitation_flux` (kg m⁻² s⁻¹, positive down: the bottom-face flux of every
+    ## sedimenting condensate) evaluated after each `time_step!`. The weights w come from
+    ## `precipitation_weights(λ, φ, h)` in `AR_AD_LOSS_FILE` (default `sensitivity/loss.jl`), called once
+    ## on the host with the child's cell-centre longitudes, latitudes and terrain height; normalised
+    ## weights make J a region-mean accumulation in mm.
+    ##
+    ## Everything the loss needs beyond the model rides in `aux`, passed `Duplicated` so that the
+    ## accumulation buffer is a traced, mutable argument. A bonus of that: Enzyme's shadow of the
+    ## weights comes back as ∂J/∂w = the accumulated precipitation itself.
+    const AD_LOSS = get(ENV, "AR_AD_LOSS", "meansquare")
+    const PRECIPITATION_LOSS = AD_LOSS in ("precip", "precipitation")
+    PRECIPITATION_LOSS || AD_LOSS == "meansquare" ||
+        error("AR_AD_LOSS=$(AD_LOSS): use `meansquare` or `precipitation`")
+
+    ad_aux = if PRECIPITATION_LOSS
+        loss_file = get(ENV, "AR_AD_LOSS_FILE", joinpath(@__DIR__, "sensitivity", "loss.jl"))
+        include(loss_file)
+        λc = Array(λnodes(host_grid, Center(), Center(), Center()))
+        φc = Array(φnodes(host_grid, Center(), Center(), Center()))
+        Hx, Hy, _ = Oceananigans.Grids.halo_size(host_grid)
+        Nxh, Nyh, _ = size(host_grid)
+        hc = Array(parent(host_grid.z.formulation.h))[Hx+1:Hx+Nxh, Hy+1:Hy+Nyh, 1]
+        ## Two accepted contracts: `precipitation_weights(λ, φ, h)` on cell centres, or
+        ## sensitivity/region.jl's `region_weights(λ_faces, φ_faces) -> (w, area)`.
+        w = if isdefined(@__MODULE__, :precipitation_weights)
+            Base.invokelatest(precipitation_weights, Float64.(λc), Float64.(φc), Float64.(hc))
+        else
+            λf = Array(λnodes(host_grid, Face(), Center(), Center()))
+            φf = Array(φnodes(host_grid, Center(), Face(), Center()))
+            first(Base.invokelatest(region_weights, Float64.(λf), Float64.(φf)))
+        end
+        size(w) == (Nxh, Nyh) || error("precipitation_weights returned $(size(w)), expected $((Nxh, Nyh))")
+        all(isfinite, w) || error("precipitation_weights returned non-finite weights")
+
+        weights_field = Field{Center, Center, Nothing}(grid)
+        host_weights = zeros(FT, size(parent(weights_field)))
+        view(host_weights, parentindices(interior(weights_field))...) .= reshape(FT.(w), Nxh, Nyh, 1)
+        copyto!(parent(weights_field), host_weights)
+
+        stage(@sprintf("AD: precipitation loss from %s — %d columns weighted, Σw = %.4g",
+                       loss_file, count(!iszero, w), sum(w)))
+        (; accumulated = Field{Center, Center, Nothing}(grid),
+           weights = weights_field,
+           start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))))
+    else
+        nothing
+    end
+
+    ad_checkpointing() = AD_CHECKPOINT_BUDGET < 0 ? true :
+                         AD_CHECKPOINT_BUDGET == 0 ? false :
+                         Reactant.Binomial(AD_CHECKPOINT_BUDGET)
+
+    function ad_loss(model, control, aux::NamedTuple, Δt, nsteps)
+        child = breeze_child(model)
+        interior(prognostic_fields(child)[AD_CONTROL]) .= interior(control)
+        acc = interior(aux.accumulated)
+        acc .= 0
+        @trace mincut = true checkpointing = ad_checkpointing() track_numbers = false for n = 1:nsteps
+            time_step!(model, Δt)
+            flux = Breeze.AtmosphereModels.bottom_precipitation_flux(child)
+            compute!(flux)
+            acc .+= ifelse(n > aux.start, Δt, zero(Δt)) .* interior(flux)
+        end
+        return sum(interior(aux.weights) .* acc)
+    end
+
+    ad_loss(model, control, ::Nothing, Δt, nsteps) = ad_loss(model, control, Δt, nsteps)
+
     function ad_loss(model, control, Δt, nsteps)
         interior(prognostic_fields(breeze_child(model))[AD_CONTROL]) .= interior(control)
         ## `AR_AD_CHECKPOINTS`: >0 = `Binomial(n)` revolve, 0 = none, -1 = `true` (Reactant's automatic
@@ -2987,7 +3115,7 @@ if get(ENV, "AR_AD", "0") == "1"
         return sum(x .^ 2) / length(x)
     end
 
-    function ad_gradient!(model, dmodel, control, dcontrol, Δt, nsteps)
+    function ad_gradient!(model, dmodel, control, dcontrol, aux, daux, Δt, nsteps)
         ## Enzyme ACCUMULATES into the shadow, so a second call would return the sum of both sweeps.
         parent(dcontrol) .= 0
         _, loss_value = Enzyme.autodiff(
@@ -2997,6 +3125,7 @@ if get(ENV, "AR_AD", "0") == "1"
             ad_loss, Enzyme.Active,
             Enzyme.Duplicated(model, dmodel),
             Enzyme.Duplicated(control, dcontrol),
+            isnothing(aux) ? Enzyme.Const(aux) : Enzyme.Duplicated(aux, daux),
             Enzyme.Const(Δt),
             Enzyme.Const(nsteps))
         return dcontrol, loss_value
@@ -3013,6 +3142,7 @@ if get(ENV, "AR_AD", "0") == "1"
     shadow_start = time_ns()
     dmodel = Enzyme.make_zero(model)
     stage(@sprintf("AD: built the model shadow in %.1f s", 1e-9 * (time_ns() - shadow_start)))
+    ad_daux = isnothing(ad_aux) ? nothing : Enzyme.make_zero(ad_aux)
 
     ## Calling the compiled thunk overflows the default 8 MB task stack (job 4784: the sweep
     ## COMPILED in 3805.8 s, then died in `Reactant.Compiler.Thunk`). `(::Thunk)(args...)` is a
@@ -3097,7 +3227,7 @@ if get(ENV, "AR_AD", "0") == "1"
         stage("AD: AR_AD_PRIMAL_ONLY=1 — compiling the LOSS only (no Enzyme)")
         compile_start = time_ns()
         r_ad_loss = @compile compile_options = ar_compile_options(
-            raise = raise_option, raise_first = true) ad_loss(model, control, Δt, ad_steps)
+            raise = raise_option, raise_first = AD_RAISE_FIRST) ad_loss(model, control, ad_aux, Δt, ad_steps)
         stage(@sprintf("AD: compiled the loss in %.1f s", 1e-9 * (time_ns() - compile_start)))
 
         ## `AR_AD_FD_DIR=<gradient.jld2>` turns this into a FINITE-DIFFERENCE check of a gradient a
@@ -3132,7 +3262,7 @@ if get(ENV, "AR_AD", "0") == "1"
         restore_ad_state!()
         eval_start = time_ns()
         J_only = with_big_stack() do
-            r_ad_loss(model, control, Δt, ad_steps)
+            r_ad_loss(model, control, ad_aux, Δt, ad_steps)
         end
 
         if !isempty(fd_dir)
@@ -3153,7 +3283,7 @@ if get(ENV, "AR_AD", "0") == "1"
 
                 restore_ad_state!()
                 J_pert = with_big_stack() do
-                    r_ad_loss(model, control, Δt, ad_steps)
+                    r_ad_loss(model, control, ad_aux, Δt, ad_steps)
                 end
 
                 fd = (host_number(J_pert) - host_number(J_only)) / fd_eps
@@ -3219,8 +3349,8 @@ if get(ENV, "AR_AD", "0") == "1"
               "($(ad_traced_steps ? "TRACED" : "static") trip count, Binomial($(AD_CHECKPOINT_BUDGET)))")
         trace_start = time_ns()
         ad_module = @code_hlo compile_options = ar_hlo_options(
-            raise = raise_option, raise_first = true) ad_gradient!(
-            model, dmodel, control, dcontrol, Δt, ad_steps)
+            raise = raise_option, raise_first = AD_RAISE_FIRST) ad_gradient!(
+            model, dmodel, control, dcontrol, ad_aux, ad_daux, Δt, ad_steps)
         stage(@sprintf("AD: traced in %.1f s", 1e-9 * (time_ns() - trace_start)))
 
         write(hlo_path, repr(ad_module))
@@ -3229,11 +3359,11 @@ if get(ENV, "AR_AD", "0") == "1"
         exit(0)
     end
 
-    stage("AD: compiling the reverse sweep (raise_first = true) — ONE compile for every window")
+    stage("AD: compiling the reverse sweep (raise_first = $(AD_RAISE_FIRST)) — ONE compile for every window")
     compile_start = time_ns()
     r_ad_gradient! = @compile compile_options = ar_compile_options(
-        raise = raise_option, raise_first = true) ad_gradient!(
-        model, dmodel, control, dcontrol, Δt, ad_steps)
+        raise = raise_option, raise_first = AD_RAISE_FIRST) ad_gradient!(
+        model, dmodel, control, dcontrol, ad_aux, ad_daux, Δt, ad_steps)
     ad_compile_seconds = 1e-9 * (time_ns() - compile_start)
     stage(@sprintf("AD: compiled the reverse sweep in %.1f s", ad_compile_seconds))
 
@@ -3245,6 +3375,7 @@ if get(ENV, "AR_AD", "0") == "1"
         ## `dmodel` above exists only to give `@compile` an argument to specialize on, and must not
         ## be carried from one window into the next.
         local dmodel = Enzyme.make_zero(model)
+        local ad_daux = isnothing(ad_aux) ? nothing : Enzyme.make_zero(ad_aux)
         restore_ad_state!()
 
         ## Same executable, new value — this is the point of tracing the trip count.
@@ -3252,7 +3383,7 @@ if get(ENV, "AR_AD", "0") == "1"
 
         sweep_start = time_ns()
         ∂J, J = with_big_stack() do
-            r_ad_gradient!(model, dmodel, control, dcontrol, Δt, nsteps_r)
+            r_ad_gradient!(model, dmodel, control, dcontrol, ad_aux, ad_daux, Δt, nsteps_r)
         end
         sweep_seconds = 1e-9 * (time_ns() - sweep_start)
 
@@ -3286,8 +3417,14 @@ if get(ENV, "AR_AD", "0") == "1"
         end
 
         if write_output
-            ad_path = get(ENV, "AR_AD_FILE",
-                          "reactant_$(get(ENV, "AR_DOMAIN", "corridor"))_gradient_$(AD_CONTROL)_$(AD_TARGET)_$(n)steps.jld2")
+            ad_default = PRECIPITATION_LOSS ?
+                "reactant_$(get(ENV, "AR_DOMAIN", "corridor"))_sensitivity_precip_$(AD_CONTROL)_$(n)steps.jld2" :
+                "reactant_$(get(ENV, "AR_DOMAIN", "corridor"))_gradient_$(AD_CONTROL)_$(AD_TARGET)_$(n)steps.jld2"
+            ad_file = get(ENV, "AR_AD_FILE", "")
+            ## A single AR_AD_FILE with several windows would be overwritten window by window, so
+            ## suffix the step count whenever more than one window runs.
+            ad_path = isempty(ad_file) ? ad_default :
+                      length(ad_step_list) > 1 ? replace(ad_file, r"\.jld2$" => "_$(n)steps.jld2") : ad_file
             write_grid_metadata(ad_path)
             JLD2.jldopen(ad_path, "a+") do file
                 file["ad/gradient"]        = g
@@ -3300,6 +3437,16 @@ if get(ENV, "AR_AD", "0") == "1"
                 file["ad/control_initial"] = Array(host_interior(control))
                 file["ad/sweep_seconds"]   = sweep_seconds
                 file["ad/compile_seconds"] = ad_compile_seconds
+                file["ad/loss_kind"]       = AD_LOSS
+                file["ad/dt"]              = Float64(Δt)
+                file["ad/control_value"]   = Array(host_interior(control))
+                write_physical_heights(file)
+                if PRECIPITATION_LOSS
+                    file["ad/weights"]              = Array(host_interior(ad_aux.weights))[:, :, 1]
+                    file["ad/precip_accumulated"]   = Array(host_interior(ad_aux.accumulated))[:, :, 1]
+                    file["ad/accum_start"]          = host_number(ad_aux.start)
+                    file["ad/loss_units"]           = "kg m^-2 (mm), weighted by ad/weights"
+                end
                 file["ad/note"] = "∂J/∂control at every interior cell, where J = mean(interior(" *
                                   string(AD_TARGET) * ")²) after $(n) time_step!s. The opening " *
                                   "first_time_step! ran OUTSIDE the differentiated region, so this " *
@@ -3370,6 +3517,7 @@ snapshot!(model) = write_output &&
 if !isnothing(r_first_time_step!)
     step_start = time_ns()
     r_first_time_step!(model, Δt)
+    VANILLA && accumulate_precipitation!(Δt)
     global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
     snapshot!(model)
 end
