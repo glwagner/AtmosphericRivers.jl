@@ -5,3 +5,4 @@ runs/
 *.png
 slurm/*.log
 sysimage_a100.so*
+renderenv/

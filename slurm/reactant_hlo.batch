@@ -1,0 +1,48 @@
+#!/bin/bash
+#SBATCH --job-name=ar-reactant-hlo
+#SBATCH --partition=gpu-dev
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=28G
+#SBATCH --time=06:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Instantiate the Reactant stack on a GPU node, then trace one step of the nest into
+# UNOPTIMIZED StableHLO (AR_HLO=1 stops before the XLA compile). Coarsest useful grid
+# (1 cell/degree over the `landfall` box) so the trace, not the problem size, is what costs.
+cd "$SLURM_SUBMIT_DIR"
+
+# Size Julia's workers to the allocation, not the node: precompile workers and BLAS
+# threads otherwise oversubscribe the cgroup and thrash.
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-8}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export HDF5_USE_FILE_LOCKING=FALSE   # NFS: HDF5 POSIX locks misbehave
+
+JULIA=~/.juliaup/bin/julia
+
+# AR_SKIP_SETUP=1 skips instantiate + the load check once the depot is warm — they cost ~4 min and
+# say nothing new when only the script changed.
+if [ "${AR_SKIP_SETUP:-0}" != "1" ]; then
+    echo "=== [$(date -Is)] instantiate + precompile ==="
+    $JULIA --startup-file=no --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' || exit 1
+
+    echo "=== [$(date -Is)] stack load check ==="
+    $JULIA --startup-file=no --project=. -e '
+        using NumericalEarth, Breeze, CUDA, Reactant
+        @info "stack loads" CUDA.functional() Reactant.devices()' || exit 1
+fi
+
+echo "=== [$(date -Is)] AR_HLO trace ==="
+# Every AR_* below is a DEFAULT the submitting environment can override (`VAR=… sbatch …`), so a
+# sweep does not need a new batch file per configuration. Only AR_HLO is fixed: this script exists
+# to dump the trace and stop.
+AR_HLO=1 \
+AR_BACKEND=${AR_BACKEND:-gpu} \
+AR_DOMAIN=${AR_DOMAIN:-landfall} \
+AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-1} \
+    stdbuf -oL -eL $JULIA --startup-file=no --project=. -t auto reactant_downscale.jl
+status=$?
+
+echo "=== [$(date -Is)] done (exit $status) ==="
+ls -l unopt_ar.mlir 2>/dev/null
+exit $status

@@ -1,0 +1,56 @@
+#!/bin/bash
+#SBATCH --job-name=ar-ad
+#SBATCH --partition=gpu-dev
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=28G
+#SBATCH --time=12:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Reverse-mode gradients through the compiled nest (AR_AD=1 in reactant_downscale.jl).
+#
+# Same model as slurm/reactant_compile.batch and the same ERA5 initial condition as job 4752 — the
+# ONLY difference is that the script differentiates a few steps instead of running 41 of them, so a
+# failure here is attributable to Enzyme/`raise_first`, not to the configuration.
+#
+# Budget hours. The forward compiles of that run cost 2456 s + 739 s; a reverse sweep compiles the
+# forward pass AND its transpose, so expect more, not less.
+cd "$SLURM_SUBMIT_DIR"
+
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-8}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export HDF5_USE_FILE_LOCKING=FALSE
+
+# Keep a failed pass pipeline's MLIR dump on shared storage — the compute node's /tmp is reclaimed
+# when the job ends (see slurm/reactant_compile.batch).
+export TMPDIR="$SLURM_SUBMIT_DIR/reactant_dumps"
+mkdir -p "$TMPDIR"
+
+JULIA=~/.juliaup/bin/julia
+
+if [ "${AR_SKIP_SETUP:-0}" != "1" ]; then
+    echo "=== [$(date -Is)] instantiate + precompile ==="
+    $JULIA --startup-file=no --project=. -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' || exit 1
+fi
+
+CHECK_BOUNDS_FLAG=""
+if [ -n "${AR_CHECK_BOUNDS:-}" ]; then
+    CHECK_BOUNDS_FLAG="--check-bounds=${AR_CHECK_BOUNDS}"
+    echo "using $CHECK_BOUNDS_FLAG"
+fi
+
+echo "=== [$(date -Is)] AD run ==="
+env | grep '^AR_' | sort
+
+AR_AD=${AR_AD:-1} \
+AR_BACKEND=${AR_BACKEND:-gpu} \
+AR_DOMAIN=${AR_DOMAIN:-landfall} \
+AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-1} \
+AR_PARENT=${AR_PARENT:-era5} \
+AR_PARENT_UNIFORM_Z=${AR_PARENT_UNIFORM_Z:-1} \
+AR_IC=${AR_IC:-interpolated} \
+    stdbuf -oL -eL $JULIA --startup-file=no $CHECK_BOUNDS_FLAG --project=. -t auto reactant_downscale.jl
+status=$?
+
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status

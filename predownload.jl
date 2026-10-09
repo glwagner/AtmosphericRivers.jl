@@ -28,10 +28,10 @@ parent_region = BoundingBox(longitude = longitude .+ (-padding, padding),
 ERA5PrescribedAtmosphere(parent_region, dates; dataset = pressure_levels,
                          dir = era5_datadir, time_indices_in_memory = 3)
 
-# The nest anchors its hydrostatic reference to the mean surface pressure over the
-# unpadded child box; the ocean surface reads SST + skin temperature over the parent box.
+# The nest anchors its hydrostatic reference (`base_pressure`) to the mean sea-level pressure
+# over the unpadded child box; the ocean surface reads SST + skin temperature over the parent box.
 @info "Single-level surface snapshots at $start_date..."
-Field(Metadatum(:surface_pressure; dataset = single_levels, date = start_date,
+Field(Metadatum(:mean_sea_level_pressure; dataset = single_levels, date = start_date,
                 region = child_region, dir = era5_datadir))
 for name in (:sea_surface_temperature, :skin_temperature)
     Field(Metadatum(name; dataset = single_levels, date = start_date,

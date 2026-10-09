@@ -15,14 +15,17 @@ NumericalEarth = "904d977b-046a-4731-8b86-9235c0d1ef02"
 Oceananigans = "9e8cae18-63c1-5223-a75c-80ca9d6e9a09"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 RRTMGP = "a01a1ee8-cea4-48fc-987c-fc7878d79da1"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+Reactant_jll = "0192cb87-2b54-54ad-80e0-3be72ad8a3c0"
 
 [sources]
-Breeze = {rev = "main", url = "https://github.com/NumericalEarth/Breeze.jl.git"}
-NumericalEarth = {path = "/home/greg_aeolus_earth/NumericalEarth.jl"}
+Breeze = {url = "https://github.com/NumericalEarth/Breeze.jl", rev = "main"}
+NumericalEarth = {url = "https://github.com/NumericalEarth/NumericalEarth.jl", rev = "glw/bottom-precipitation-flux"}
 
 [compat]
-Breeze = "0.8"
+Breeze = "0.11"
 CUDA = "6"
 CairoMakie = "0.15"
 CopernicusClimateDataStore = "0.2"
-Oceananigans = "0.110"
+Oceananigans = "0.113"
+Reactant = "0.2.278"
