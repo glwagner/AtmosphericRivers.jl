@@ -57,8 +57,8 @@ run_one () {
     AR_STEPS=$STEPS \
     AR_CHUNK=${AR_CHUNK:-90} \
     AR_SPONGE=1 \
-    AR_OUTPUT=1 \
-    AR_OUTPUT_FILE=reactant_landfall_era5_9cpd_cuda_hydro_${RUN_HOURS}h_dt${AR_DT:-10}${AR_TERRAIN:+_$AR_TERRAIN}_${tag}.jld2 \
+    AR_OUTPUT=${AR_OUTPUT:-1} \
+    AR_OUTPUT_FILE=reactant_landfall_era5_9cpd_cuda_hydro_${RUN_HOURS}h_dt${AR_DT:-10}${AR_TERRAIN:+_$AR_TERRAIN}${AR_TERRAIN_SMOOTHING:+_s$AR_TERRAIN_SMOOTHING}_${tag}.jld2 \
         stdbuf -oL -eL $JULIA --startup-file=no --project=. -t auto reactant_downscale.jl
     local status=$?
     echo "=== [$(date -Is)] run $tag done (exit $status) ==="
