@@ -664,7 +664,9 @@ end
 ##    guarantee either.
 ##
 ##    `AR_FMULADD_FIX=0` restores CUDACore's FMA override, for testing once enzymexla can lower it.
-if get(ENV, "AR_FMULADD_FIX", "1") == "1"
+##    Off by default under `AR_ARCH=cuda`: no Reactant kernel runs there, so the override would only
+##    de-fuse every stencil of the production run (≈2% of the GPU step on an A100, job 2266).
+if get(ENV, "AR_FMULADD_FIX", VANILLA ? "0" : "1") == "1"
     ## CUDACore is a transitive dependency (of CUDA.jl), so `import CUDACore` fails; reach it through
     ## the loaded-module table. `@device_override` is CUDACore's own macro, so evaluating inside that
     ## module resolves it, and the identical signature replaces the overlay entry in place.
@@ -2213,8 +2215,9 @@ set!(ocean.sea_surface_temperature[1], surface_temperature)
 # gradient sees the radiation pathway.
 radiation = if get(ENV, "AR_RADIATION", "0") == "1"
     radiation_every = parse(Int, get(ENV, "AR_RADIATION_EVERY", "1"))
-    stage("radiation: all-sky RRTMGP on IterationInterval($(radiation_every)) — NOT TimeInterval, \
-           which mutates host state and cannot be traced")
+    stage(VANILLA ? "radiation: all-sky RRTMGP on TimeInterval($(radiation_every) Δt) — once per interval" :
+                    "radiation: all-sky RRTMGP on IterationInterval($(radiation_every)) — NOT TimeInterval, \
+                     which mutates host state and cannot be traced")
     ## A bare nest must bind the surface temperature ITSELF. The RTM constructors accept
     ## `surface_temperature = nothing` so a coupled model can wire its interface SST in afterwards, and
     ## solving without one throws (`assert_bound_surface_temperature`, job 4846):
@@ -2258,11 +2261,20 @@ radiation = if get(ENV, "AR_RADIATION", "0") == "1"
                    cos_zenith == 0 ? "longwave only (matches the case's pre-dawn start hour)" :
                                      "exercises the shortwave solver (NOT the case's start hour, which is pre-dawn)"))
 
+    ## Eagerly, `IterationInterval` solves the radiation more than once per interval: `update_state!`
+    ## runs after every Runge–Kutta stage and asks the schedule each time, and the clock's iteration
+    ## only ticks at the end of the step, so `iteration % interval == 0` holds for the final update of
+    ## step n-1 AND the first two stages of step n — three RRTMGP solves per interval (job 2266:
+    ## ~0.5 s each on an A100, the run's largest single cost at Δt ≥ 30 s). `TimeInterval` counts its
+    ## actuations and fires once; its host-side bookkeeping is exactly what cannot be traced, so the
+    ## Reactant path keeps `IterationInterval`.
+    radiation_schedule = VANILLA ? TimeInterval(radiation_every * Δt) : IterationInterval(radiation_every)
+
     RadiativeTransferModel(grid, AllSkyOptics(), child.thermodynamic_constants;
                            solar_position = FixedCosineZenith(cos_zenith),
                            surface_albedo = 0.1,
                            surface_temperature = rad_surface_T,
-                           schedule = IterationInterval(radiation_every))
+                           schedule = radiation_schedule)
 else
     nothing
 end
