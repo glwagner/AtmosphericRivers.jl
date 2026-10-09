@@ -138,6 +138,7 @@ using Reactant
 using CUDA                       # Reactant needs CUDA.jl loaded to raise KA kernels — on ANY backend
 using Printf
 using Dates: DateTime, Hour   # `Hour` builds the ERA5 parent's 3-level hourly window
+import Dates                 # `Dates.format` for ERA5 file stamps
 
 using Oceananigans.Advection: AdaptiveVerticallyImplicitDiscretization
 using Oceananigans.Architectures: ReactantState, on_architecture
@@ -1762,7 +1763,19 @@ traced_clock() = VANILLA ?
 
 model_clock = traced_clock()
 
-microphysics = breeze_extension.default_nested_microphysics()
+# `AR_MICROPHYSICS=nonequilibrium` swaps the nest's default 1-moment SATURATION-ADJUSTMENT mixed-phase
+# scheme for the 1-moment NON-EQUILIBRIUM mixed-phase one (prognostic ρqᵛ, ρqᶜˡ, ρqᶜⁱ, ρqʳ, ρqˢⁿ). The
+# default has no snow source at all on Breeze main: `microphysical_tendency(::MP1M, Val(:ρqˢⁿ))` falls
+# through to zero (only the non-equilibrium variant defines ice → snow autoconversion, accretion,
+# deposition and melting), so cloud ice sits in ρqᵉ forever and only warm rain reaches the ground.
+microphysics = if get(ENV, "AR_MICROPHYSICS", "equilibrium") == "nonequilibrium"
+    cm_extension = Base.get_extension(Breeze, :BreezeCloudMicrophysicsExt)
+    ## Any non-`nothing` ice entry is a phase indicator, materialized from the scheme's own parameters.
+    cm_extension.OneMomentCloudMicrophysics(FT; cloud_formation = Breeze.Microphysics.NonEquilibriumCloudFormation(nothing, :ice))
+else
+    breeze_extension.default_nested_microphysics()
+end
+stage("microphysics: $(summary(microphysics))")
 explicit_scalar_advection = breeze_extension.default_nested_scalar_advection(microphysics)
 
 if aiva
@@ -2285,6 +2298,36 @@ ocean_grid = LatitudeLongitudeGrid(arch;
     return h > 1 ? ocean - 4 - 6.5e-3 * h : ocean
 end
 
+# `AR_SST=era5` replaces the analytic field with the cached ERA5 snapshot at `start_date` — `sst` over
+# open water, `skt` (skin temperature) over land and sea ice, as `downscale.jl` does — sampled at the
+# nearest 0.25° point to each child cell centre. Read from the corridor box cache (`AR_SST_REGION`).
+if get(ENV, "AR_SST", "analytic") == "era5"
+    const NCDatasets = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "NCDatasets")
+    sst_box = get(ENV, "AR_SST_REGION", "-170.5_-109.5_24.5_60.5")
+    era5_single(name, var) = NCDatasets.NCDataset(joinpath(era5_datadir,
+            "$(name)_ERA5HourlySingleLevel_$(Dates.format(start_date, "yyyy-mm-ddTHH"))_$(sst_box).nc")) do ds
+        x = ds[var]
+        values = ndims(x) == 3 ? x[:, :, 1] : x[:, :]
+        (Float64.(ds["longitude"][:]), Float64.(ds["latitude"][:]), Float64.(coalesce.(values, NaN)))
+    end
+    sst_λ, sst_φ, sst_values = era5_single("sea_surface_temperature", "sst")
+    _, _, skt_values = era5_single("skin_temperature", "skt")
+    λc = λnodes(host_grid, Center(), Center(), Center())
+    φc = φnodes(host_grid, Center(), Center(), Center())
+    const era5_surface_temperature = [begin
+                                          i = argmin(abs.(sst_λ .- λc[ic])); j = argmin(abs.(sst_φ .- φc[jc]))
+                                          isfinite(sst_values[i, j]) && terrain_elevation(λc[ic], φc[jc]) ≤ 1 ?
+                                              sst_values[i, j] : skt_values[i, j]
+                                      end for ic in 1:Nx, jc in 1:Ny]
+    @inline function surface_temperature(λ, φ)
+        i = clamp(round(Int, (λ - λ₁) / Δ + 0.5), 1, Nx)
+        j = clamp(round(Int, (φ - φ₁) / Δ + 0.5), 1, Ny)
+        return @inbounds era5_surface_temperature[i, j]
+    end
+    stage(@sprintf("AR_SST=era5: ERA5 sst/skt at %s, %.1f–%.1f K", start_date,
+                   extrema(era5_surface_temperature)...))
+end
+
 ocean = PrescribedOcean(ocean_grid)
 set!(ocean.sea_surface_temperature[1], surface_temperature)
 
@@ -2364,11 +2407,22 @@ radiation = if get(ENV, "AR_RADIATION", "0") == "1"
     ##     shortwave path. A fixed zenith also means no diurnal cycle at all, which is harmless over a
     ##     20 s AD window and wrong over a multi-hour run — `DiurnalSolarPosition` is the traceable
     ##     option there (analytic, no calendar), if that becomes the configuration of interest.
+    ##
+    ## None of that applies under `AR_ARCH=cuda`, where nothing is traced: there `AR_SOLAR=apparent` (the
+    ## default on that path) uses Breeze's `ApparentSolarPosition` with `epoch = start_date`, i.e. the
+    ## real sun for each column and model time — the diurnal cycle a multi-hour hindcast needs.
+    ## `AR_SOLAR=fixed` keeps `FixedCosineZenith(AR_SOLAR_COS_ZENITH)` on either path.
+    solar_mode = get(ENV, "AR_SOLAR", VANILLA ? "apparent" : "fixed")
+    solar_mode == "apparent" && !VANILLA && error("AR_SOLAR=apparent consults the calendar and cannot be traced")
     cos_zenith = parse(Float64, get(ENV, "AR_SOLAR_COS_ZENITH", "0.35"))
-    stage(@sprintf("radiation solar position: FixedCosineZenith(%.3g) — no calendar, so traceable; \
-                    %s", cos_zenith,
-                   cos_zenith == 0 ? "longwave only (matches the case's pre-dawn start hour)" :
-                                     "exercises the shortwave solver (NOT the case's start hour, which is pre-dawn)"))
+    solar_position = solar_mode == "apparent" ? ApparentSolarPosition(epoch = start_date) :
+                                                FixedCosineZenith(cos_zenith)
+    solar_mode == "apparent" ?
+        stage("radiation solar position: ApparentSolarPosition(epoch = $(start_date)) — real diurnal cycle") :
+        stage(@sprintf("radiation solar position: FixedCosineZenith(%.3g) — no calendar, so traceable; \
+                        %s", cos_zenith,
+                       cos_zenith == 0 ? "longwave only (matches the case's pre-dawn start hour)" :
+                                         "exercises the shortwave solver (NOT the case's start hour, which is pre-dawn)"))
 
     ## Eagerly, `IterationInterval` solves the radiation more than once per interval: `update_state!`
     ## runs after every Runge–Kutta stage and asks the schedule each time, and the clock's iteration
@@ -2380,7 +2434,7 @@ radiation = if get(ENV, "AR_RADIATION", "0") == "1"
     radiation_schedule = VANILLA ? TimeInterval(radiation_every * Δt) : IterationInterval(radiation_every)
 
     RadiativeTransferModel(grid, AllSkyOptics(), child.thermodynamic_constants;
-                           solar_position = FixedCosineZenith(cos_zenith),
+                           solar_position,
                            surface_albedo = 0.1,
                            surface_temperature = rad_surface_T,
                            schedule = radiation_schedule)
