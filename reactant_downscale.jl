@@ -3090,9 +3090,26 @@ if get(ENV, "AR_AD", "0") == "1"
 
         stage(@sprintf("AD: precipitation loss from %s — %d columns weighted, Σw = %.4g",
                        loss_file, count(!iszero, w), sum(w)))
-        (; accumulated = Field{Center, Center, Nothing}(grid),
-           weights = weights_field,
-           start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))))
+        base_aux = (; accumulated = Field{Center, Center, Nothing}(grid),
+                      weights = weights_field,
+                      start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))))
+
+        ## `AR_AD_DT_SCHEDULE=<file>`: replay a recorded adaptive-Δt schedule (one Δt in seconds per
+        ## line, step n of the AD window uses line n) instead of the fixed `AR_DT`. The schedule rides
+        ## in as a device array indexed by the traced step counter, so `time_step!` receives a TRACED
+        ## Δt. The acoustic substep count is still host-decided from `AR_DT` (shim 5), so set `AR_DT`
+        ## to the schedule's maximum. Windows longer than the schedule reuse its last entry.
+        schedule_file = get(ENV, "AR_AD_DT_SCHEDULE", "")
+        if isempty(schedule_file)
+            base_aux
+        else
+            dts = [parse(FT, l) for l in eachline(schedule_file) if !isempty(strip(l))]
+            maximum(dts) <= Δt || @warn "AR_AD_DT_SCHEDULE: max Δt $(maximum(dts)) s exceeds AR_DT = $(Δt) s, \
+                                         which sized the acoustic substeps"
+            stage(@sprintf("AD: replaying %d recorded Δt from %s (%.1f–%.1f s, mean %.1f s)",
+                           length(dts), schedule_file, minimum(dts), maximum(dts), sum(dts) / length(dts)))
+            merge(base_aux, (; dts = Reactant.to_rarray(dts)))
+        end
     else
         nothing
     end
@@ -3166,16 +3183,19 @@ if get(ENV, "AR_AD", "0") == "1"
                          AD_CHECKPOINT_BUDGET == 0 ? false :
                          Reactant.Binomial(AD_CHECKPOINT_BUDGET)
 
+    scheduled_Δt(aux, n, Δt) = haskey(aux, :dts) ? aux.dts[min(n, length(aux.dts))] : Δt
+
     function ad_loss(model, control, aux::NamedTuple, Δt, nsteps)
         child = breeze_child(model)
         interior(prognostic_fields(child)[AD_CONTROL]) .= interior(control)
         acc = interior(aux.accumulated)
         acc .= 0
         @trace mincut = true checkpointing = ad_checkpointing() track_numbers = false for n = 1:nsteps
-            time_step!(model, Δt)
+            Δtₙ = scheduled_Δt(aux, n, Δt)
+            time_step!(model, Δtₙ)
             flux = Breeze.AtmosphereModels.bottom_precipitation_flux(child)
             compute!(flux)
-            acc .+= ifelse(n > aux.start, Δt, zero(Δt)) .* interior(flux)
+            acc .+= ifelse(n > aux.start, Δtₙ, zero(Δtₙ)) .* interior(flux)
         end
         return sum(interior(aux.weights) .* acc)
     end
