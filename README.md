@@ -44,9 +44,13 @@ sbatch slurm/downscale.batch                         # script 2: the 72 h hindca
 Requires CDS credentials (`~/.cdsapirc`, mirrored to `~/.config/era5cli/cds_key.txt`)
 with the ERA5 single-level and pressure-level licences accepted.
 
-NumericalEarth is sourced by path from `~/NumericalEarth.jl` (branch `glw/cleanup`, which
-carries the Dec-2025 ERA5 date range and the `tcwv`/`viwve`/`viwvn` IVT variables).
-Breeze comes from `main` (≥ 0.8, which has the RRTMGP coupled-model APIs).
+Breeze is tracked from `main` and NumericalEarth from a git branch, both via `[sources]`
+in `Project.toml`. Breeze `main` carries the unified sedimentation transport and the
+moist-state fixes. NumericalEarth points at `glw/bottom-precipitation-flux`
+(NumericalEarth#753: `main` plus two fixes for coupling a Breeze atmosphere to a
+`PrescribedOcean` on Breeze `main`); switch it to `rev = "main"` once #753 merges. The
+Manifest pins the exact commits, and `Pkg.update()` moves both forward. Resolve with
+Julia 1.12 (the Manifest's `julia_version`).
 
 ## Configuration (v0: one A100-40GB)
 
