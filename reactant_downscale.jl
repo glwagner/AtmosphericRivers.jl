@@ -3471,6 +3471,8 @@ if get(ENV, "AR_AD", "0") == "1"
                 file["ad/sweep_seconds"]   = sweep_seconds
                 file["ad/compile_seconds"] = ad_compile_seconds
                 file["ad/loss_kind"]       = AD_LOSS
+                file["ad/terrain_source"]  = get(ENV, "AR_TERRAIN", "analytic")
+                file["ad/terrain_smoothing_passes"] = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2"))
                 file["ad/dt"]              = Float64(Δt)
                 file["ad/control_value"]   = Array(host_interior(control))
                 write_physical_heights(file)
@@ -3578,6 +3580,8 @@ for n in 1:chunks
     r_step_for!(model, Δt, chunk)
     global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
     snapshot!(model)
+    ## A NaN never heals: stop rather than step (and write) garbage for the rest of the run.
+    worst_nonfinite > 0 && break
 end
 
 # One unambiguous verdict line, so the run answers "are there NaNs after stepping?" without anyone
