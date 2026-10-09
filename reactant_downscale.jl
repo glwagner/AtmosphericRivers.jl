@@ -3547,10 +3547,28 @@ worst_nonfinite = 0
 snapshot!(model) = write_output &&
     write_snapshot(output_path, model, host_number(model.clock.iteration), host_number(model.clock.time))
 
+# `AR_SPINUP_STEPS` steps at `AR_SPINUP_DT` (eager CUDA only), first step included, before the main
+# loop. The interpolated initial condition is out of balance and its first steps launch a violent
+# adjustment (ρw −38 after one 40 s step, job 2160); a short spin-up at a small step sheds it, so
+# `AR_DT` then only has to be stable for the adjusted flow. The acoustic substep count stays sized
+# for `AR_DT`, which only over-resolves the acoustics of the smaller spin-up step.
+spinup_steps = parse(Int, get(ENV, "AR_SPINUP_STEPS", "0"))
+Δt_spinup = parse(FT, get(ENV, "AR_SPINUP_DT", "10"))
+spinup_steps > 0 && !VANILLA && error("AR_SPINUP_STEPS requires AR_ARCH=cuda")
+Δt_first = spinup_steps > 0 ? Δt_spinup : Δt
+
 if !isnothing(r_first_time_step!)
     step_start = time_ns()
-    r_first_time_step!(model, Δt)
-    VANILLA && accumulate_precipitation!(Δt)
+    r_first_time_step!(model, Δt_first)
+    VANILLA && accumulate_precipitation!(Δt_first)
+    global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
+    snapshot!(model)
+end
+
+if spinup_steps > 0
+    step_start = time_ns()
+    step_for!(model, Δt_spinup, spinup_steps)
+    stage(@sprintf("spin-up: %d steps at Δt = %s done", spinup_steps, prettytime(Δt_spinup)))
     global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
     snapshot!(model)
 end
