@@ -2242,6 +2242,12 @@ end
 # advective CFL of whatever resolution `AR_CELLS_PER_DEGREE` selects. It is set back at shim 5, which
 # needs it to size the acoustic substep loop.
 
+## No NumericalEarth branch defines `Base.eltype(::NestedModel)` (it lived only in a local checkout),
+## so supply it here when only the `AbstractModel` fallback is present.
+if !(Base.unwrap_unionall(which(eltype, Tuple{typeof(nest)}).sig).parameters[2] <: NestedModel)
+    @eval Base.eltype(nest::NestedModel) = eltype(nest.child.grid)
+end
+
 atmosphere = Simulation(nest; Δt)
 
 # `Simulation` stores `Δt` in a TYPED field, converted with `TT = eltype(model)`, and
