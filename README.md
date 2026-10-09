@@ -22,10 +22,14 @@ corridor; the moisture traced back ~11,000 km to the western Pacific.
 
 ## Contents
 
-For a Julia-only, CPU-based movie of offshore development through landfall, see
-[`analysis/lifecycle`](analysis/lifecycle/README.md). It combines hourly 0.25°
-ERA5 over the dateline-spanning North Pacific with an optional existing 3 km,
-30-minute hindcast and exports a separate detailed landfall movie.
+For **high-resolution satellite movies**, see the
+[GOES-18 workflow](analysis/lifecycle/GOES.md): 10-minute, 2 km water-vapour imagery
+of offshore development through landfall, plus a 5-minute, 500 m visible-light
+close-up. All acquisition and rendering code is Julia. Resolutions are at nadir.
+
+For complementary moisture-transport diagnostics, the
+[ERA5 and hindcast workflow](analysis/lifecycle/README.md) combines hourly 0.25°
+ERA5 over the North Pacific with an optional existing 3 km, 30-minute hindcast.
 
 | File | Purpose |
 |---|---|

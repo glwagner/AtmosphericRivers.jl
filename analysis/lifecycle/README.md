@@ -1,5 +1,10 @@
 # Development to landfall: December 2025
 
+For **actual high-resolution GOES satellite imagery**, use the
+[GOES-18 workflow](GOES.md): 10-minute water-vapour imagery and a 5-minute,
+500 m visible-light close-up. This page documents the separate reanalysis and
+simulation diagnostics.
+
 This Julia-only visualization follows the **December 8–12, 2025 Pacific Northwest
 atmospheric river**, starting on December 3 to show its offshore evolution. The
 event date matches this repository's case. See the
