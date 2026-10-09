@@ -1714,7 +1714,13 @@ thermodynamic_constants = Breeze.ThermodynamicConstants(FT)
 host_substeps = Breeze.CompressibleEquations.compute_acoustic_substeps(host_grid, Δt,
                                                                       thermodynamic_constants,
                                                                       acoustic_cfl)
-acoustic_substeps = parse(Int, get(ENV, "AR_ACOUSTIC_SUBSTEPS", string(host_substeps)))
+# `AR_ADAPTIVE=1` (eager CUDA only) floats Δt with an advective-CFL wizard — see the stepping section.
+# The substep count must then follow Δt, so it is left to Breeze (`substeps = nothing`), which
+# recomputes it from each stage's interval with the same formula. `AR_ACOUSTIC_SUBSTEPS` still wins.
+adaptive_Δt = get(ENV, "AR_ADAPTIVE", "0") == "1"
+adaptive_Δt && !VANILLA && error("AR_ADAPTIVE=1 requires AR_ARCH=cuda: a traced loop has a fixed Δt")
+acoustic_substeps = haskey(ENV, "AR_ACOUSTIC_SUBSTEPS") ? parse(Int, ENV["AR_ACOUSTIC_SUBSTEPS"]) :
+                    adaptive_Δt ? nothing : host_substeps
 
 ## Otherwise exactly `default_nested_dynamics(grid; …)`: an upper sponge over the lid, no divergence
 ## damping, and the script's `base_pressure`. Only `substeps` and `sponge` differ.
@@ -1899,7 +1905,8 @@ if get(ENV, "AR_TARGET_PROBE_ONLY", "0") == "1"
 end
 
 stage("nest built (exchanger window filled, open BCs + Davies forcing in place); " *
-      "$(acoustic_substeps) acoustic substeps per step (host-decided at CFL $(acoustic_cfl)); " *
+      (isnothing(acoustic_substeps) ? "acoustic substeps recomputed from each Δt at CFL $(acoustic_cfl); " :
+       "$(acoustic_substeps) acoustic substeps per step (host-decided at CFL $(acoustic_cfl)); ") *
       "upper sponge $(isnothing(sponge) ? "OFF" : "on")")
 
 # ## Initial condition
@@ -3620,7 +3627,99 @@ if spinup_steps > 0
     snapshot!(model)
 end
 
-for n in 1:chunks
+# ### `AR_ADAPTIVE=1`: an advective-CFL wizard (eager CUDA only)
+#
+# What Oceananigans' `TimeStepWizard` does, written out because the stepped object here is the
+# coupled model rather than a `Simulation`: before every step, Δt = min(AR_CFL · τ, 1.1 · Δt_prev),
+# clamped to [AR_MIN_DT, AR_MAX_DT], where τ = `cell_advection_timescale(child)` — Breeze's
+# direction-aware timescale (three-dimensional, with rain/snow fall speeds in the vertical term,
+# unless every scheme is AIVA). The acoustic substep count follows Δt (`substeps = nothing` above).
+# The run covers the same simulated time as the fixed-Δt run (AR_STEPS · AR_DT) and reports and
+# snapshots every AR_CHUNK · AR_DT seconds; the last steps of each interval are evened out to land
+# on its end. Every step's Δt goes to `timeseries_dt/*` in the output file and to a CSV beside it.
+# Radiation is already on a TimeInterval on this path, so its cadence does not drift with Δt.
+if adaptive_Δt
+    wizard_cfl = parse(Float64, get(ENV, "AR_CFL", "0.7"))
+    wizard_max_Δt = parse(Float64, get(ENV, "AR_MAX_DT", "Inf"))
+    wizard_min_Δt = parse(Float64, get(ENV, "AR_MIN_DT", "1"))
+    wizard_max_change = parse(Float64, get(ENV, "AR_MAX_CHANGE", "1.1"))
+    stage(@sprintf("adaptive Δt: cfl %.2f, max change %.2f, Δt ∈ [%g, %g] s; substeps follow Δt",
+                   wizard_cfl, wizard_max_change, wizard_min_Δt, wizard_max_Δt))
+
+    child = breeze_child(model)
+    advective_timescale() = Float64(Oceananigans.Advection.cell_advection_timescale(child))
+    horizontal_timescale() = Float64(Oceananigans.Advection.cell_advection_timescale(child,
+                                         Oceananigans.TurbulenceClosures.HorizontalFormulation()))
+    substeps_for(Δt) = Breeze.CompressibleEquations.compute_acoustic_substeps(host_grid, FT(Δt),
+                                                                           thermodynamic_constants,
+                                                                           acoustic_cfl)
+    function step_adaptively!(model, Δt_wizard)
+        dt_log = (iteration = Int[], time = Float64[], dt = Float64[], advective_timescale = Float64[],
+                  horizontal_timescale = Float64[], substeps = Int[])
+        clock_time() = Float64(host_number(model.clock.time))
+        t_run_end = clock_time() + steps * Float64(Δt)
+        interval = chunk * Float64(Δt)
+
+        while clock_time() < t_run_end - 0.05
+            step_start = time_ns()
+            t = clock_time()
+            t_target = min(t_run_end, (floor(t / interval + 1e-6) + 1) * interval)
+            n_before = length(dt_log.dt)
+            while t < t_target - 0.05
+                τ = advective_timescale()
+                Δt_wizard = clamp(min(wizard_cfl * τ, wizard_max_change * Δt_wizard), wizard_min_Δt, wizard_max_Δt)
+                remaining = t_target - t
+                Δt_step = remaining ≤ Δt_wizard ? remaining :
+                          remaining < 2Δt_wizard ? remaining / 2 : Δt_wizard
+                time_step!(model, FT(Δt_step))
+                accumulate_precipitation!(FT(Δt_step))
+                push!(dt_log.iteration, host_number(model.clock.iteration))
+                push!(dt_log.time, clock_time())
+                push!(dt_log.dt, Δt_step)
+                push!(dt_log.advective_timescale, τ)
+                push!(dt_log.horizontal_timescale, horizontal_timescale())
+                push!(dt_log.substeps, substeps_for(Δt_step))
+                t = clock_time()
+            end
+            global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
+            recent = n_before+1:length(dt_log.dt)
+            stage(@sprintf("adaptive Δt over the last %d steps: min %.2f s, mean %.2f s, max %.2f s; substeps %d–%d",
+                           length(recent), minimum(dt_log.dt[recent]), sum(dt_log.dt[recent]) / length(recent),
+                           maximum(dt_log.dt[recent]), minimum(dt_log.substeps[recent]),
+                           maximum(dt_log.substeps[recent])))
+            snapshot!(model)
+            worst_nonfinite > 0 && break
+        end
+        return dt_log
+    end
+
+    dt_log = step_adaptively!(model, Float64(spinup_steps > 0 ? Δt_spinup : Δt))
+
+    if write_output
+        JLD2.jldopen(output_path, "a+") do file
+            for (name, series) in pairs(dt_log)
+                file["timeseries_dt/$name"] = series
+            end
+            file["meta/adaptive"] = (cfl = wizard_cfl, max_Δt = wizard_max_Δt, min_Δt = wizard_min_Δt,
+                                     max_change = wizard_max_change)
+        end
+        csv_path = replace(output_path, r"\.jld2$" => "") * "_dt.csv"
+        open(csv_path, "w") do io
+            println(io, "iteration,time_s,dt_s,advective_timescale_s,horizontal_timescale_s,acoustic_substeps")
+            for n in eachindex(dt_log.dt)
+                println(io, join((dt_log.iteration[n], dt_log.time[n], dt_log.dt[n],
+                                  dt_log.advective_timescale[n], dt_log.horizontal_timescale[n],
+                                  dt_log.substeps[n]), ","))
+            end
+        end
+        stage("wrote the Δt series ($(length(dt_log.dt)) steps) to $(csv_path)")
+    end
+    sorted = sort(dt_log.dt)
+    stage(@sprintf("adaptive Δt over the run: %d steps, min %.2f s, median %.2f s, max %.2f s",
+                   length(sorted), first(sorted), sorted[cld(length(sorted), 2)], last(sorted)))
+end
+
+for n in 1:(adaptive_Δt ? 0 : chunks)
     step_start = time_ns()
     r_step_for!(model, Δt, chunk)
     global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
