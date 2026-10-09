@@ -1623,6 +1623,8 @@ stage(@sprintf("parent ready: %d×%d×%d PrescribedAtmosphere over [%.2f, %.2f]�
 # surface elevation to blend toward.
 
 relax_width = parse(Int, get(ENV, "AR_RELAX_WIDTH", "5"))
+## `AR_RELAX_TIMESCALE` (seconds, default 300) sets the Davies relaxation rate 1/τ at the frame.
+relax_rate = 1 / parse(Float64, get(ENV, "AR_RELAX_TIMESCALE", "300"))
 aiva = get(ENV, "AR_AIVA", "0") == "1"
 
 # ### The traced clock
@@ -1802,7 +1804,7 @@ nest = if NATIVE_PARENT
                             terrain = native_terrain,
                             terrain_blend_length,
                             terrain_smoothing_passes = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2")),
-                            relaxation_rate = 1/300,
+                            relaxation_rate = relax_rate,
                             relaxation_width = relax_width,
                             ## Passed explicitly so the anchor matches `dynamics` below, which was
                             ## built with it — otherwise this method derives its own from the
@@ -1817,7 +1819,7 @@ nest = if NATIVE_PARENT
 else
     Reactant.@allowscalar nested_atmosphere_model(parent_atmosphere, grid;
                                                      terrain = nothing,
-                                                     relaxation_rate = 1/300,
+                                                     relaxation_rate = relax_rate,
                                                      relaxation_width = relax_width,
                                                      base_pressure = p_std,
                                                      clock = model_clock,
@@ -2062,7 +2064,7 @@ elseif ic_mode === :interpolated
         twin_drag = parse(Float64, get(ENV, "AR_BOTTOM_DRAG", "0"))
         cpu_nest = nested_atmosphere_model(cpu_parent, host_grid;
                                            terrain = nothing,
-                                           relaxation_rate = 1/300,
+                                           relaxation_rate = relax_rate,
                                            relaxation_width = relax_width,
                                            base_pressure = p_std,
                                            clock = Clock(time = zero(FT)),
