@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=ar-ad
-#SBATCH --partition=gpu-dev
+#SBATCH --partition=gpuprod
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=28G
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
 #SBATCH --time=12:00:00
 #SBATCH --output=slurm/%x-%j.log
 
@@ -16,6 +16,11 @@
 # Budget hours. The forward compiles of that run cost 2456 s + 739 s; a reverse sweep compiles the
 # forward pass AND its transpose, so expect more, not less.
 cd "$SLURM_SUBMIT_DIR"
+
+# Same depot as slurm/instantiate_prod.batch and the cuda_* scripts, so a job here reuses their
+# precompiled packages (AR_SKIP_SETUP=1 skips the instantiate entirely).
+export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
+mkdir -p "$HOME/.julia-prod"
 
 export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-8}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}

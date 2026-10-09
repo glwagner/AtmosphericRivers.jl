@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=ar-reactant-hlo
-#SBATCH --partition=gpu-dev
+#SBATCH --partition=gpuprod
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=28G
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
 #SBATCH --time=06:00:00
 #SBATCH --output=slurm/%x-%j.log
 
@@ -11,6 +11,11 @@
 # UNOPTIMIZED StableHLO (AR_HLO=1 stops before the XLA compile). Coarsest useful grid
 # (1 cell/degree over the `landfall` box) so the trace, not the problem size, is what costs.
 cd "$SLURM_SUBMIT_DIR"
+
+# Same depot as slurm/instantiate_prod.batch and the cuda_* scripts, so a job here reuses their
+# precompiled packages (AR_SKIP_SETUP=1 skips the instantiate entirely).
+export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
+mkdir -p "$HOME/.julia-prod"
 
 # Size Julia's workers to the allocation, not the node: precompile workers and BLAS
 # threads otherwise oversubscribe the cgroup and thrash.
