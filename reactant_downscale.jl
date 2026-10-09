@@ -3509,6 +3509,9 @@ if get(ENV, "AR_AD", "0") == "1"
                 file["ad/loss_kind"]       = AD_LOSS
                 file["ad/terrain_source"]  = get(ENV, "AR_TERRAIN", "etopo")
                 file["ad/terrain_smoothing_passes"] = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2"))
+                file["ad/spinup_steps"]    = ad_spinup_steps
+                file["ad/spinup_dt"]       = Float64(Δt_first)
+                file["ad/control_time"]    = Float64(host_number(ad_clock0[1][:time]))
                 file["ad/dt"]              = Float64(Δt)
                 file["ad/control_value"]   = Array(host_interior(control))
                 write_physical_heights(file)
