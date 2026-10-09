@@ -1728,11 +1728,11 @@ version = "1.3.0"
 
 [[deps.NumericalEarth]]
 deps = ["Accessors", "Adapt", "CFTime", "ClimaSeaIce", "CubedSphere", "DataDeps", "Dates", "Distances", "DocStringExtensions", "Downloads", "GPUArraysCore", "Glob", "ImageMorphology", "JLD2", "KernelAbstractions", "LibCURL", "MeshArrays", "NCDatasets", "NetworkOptions", "Oceananigans", "OffsetArrays", "PrecompileTools", "Printf", "Scratch", "SeawaterPolynomials", "StaticArrays", "Statistics", "Thermodynamics", "ZipFile"]
-git-tree-sha1 = "0dd63e5a6babd6da7956c417b6c3b771a9a689c0"
+git-tree-sha1 = "81b51d632799e3512420fd10cd1a1d668b208829"
 repo-rev = "glw/bottom-precipitation-flux"
 repo-url = "https://github.com/NumericalEarth/NumericalEarth.jl"
 uuid = "904d977b-046a-4731-8b86-9235c0d1ef02"
-version = "0.8.1"
+version = "0.8.2"
 
     [deps.NumericalEarth.extensions]
     NumericalEarthArchGDALExt = ["ArchGDAL", "GDAL"]
