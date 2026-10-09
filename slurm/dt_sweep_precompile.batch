@@ -1,0 +1,21 @@
+#!/bin/bash
+#SBATCH --job-name=ar-dtsweep-precompile
+#SBATCH --partition=gpua100,gpua100largex4,gpuprod,gpuprodflex
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=60G
+#SBATCH --time=03:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Precompile the root project ONCE into a sweep-private depot with a portable CPU target, so the
+# dt_sweep members — which land on T4, A100 and H100 hosts with different CPUs — share one set of
+# pkgimages instead of recompiling (and overwriting each other's) native images in ~/.julia-prod.
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-dtsweep:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_CPU_TARGET="generic;haswell,clone_all"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-6}
+mkdir -p "$HOME/.julia-dtsweep"
+lscpu | grep "Model name"
+~/.juliaup/bin/julia --startup-file=no --project=. -e '
+    using Pkg; Pkg.precompile()
+    using CUDA, Breeze, NumericalEarth, Oceananigans, Reactant; println("loaded OK")'

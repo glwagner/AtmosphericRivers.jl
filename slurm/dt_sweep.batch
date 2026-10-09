@@ -1,0 +1,87 @@
+#!/bin/bash
+#SBATCH --job-name=ar-dtsweep
+#SBATCH --partition=gpua100,gpudev,gpua100largex4,gpuprod,gpuprodflex
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=13G
+#SBATCH --exclude=agcpv2dev-gpudevstaticno-0   # fails every job within seconds, no log written
+#SBATCH --time=03:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# One member of the time-step sweep: the eager-CUDA hydrostatic-parent case of
+# slurm/cuda_hydro_long.batch (balancer off) over real ETOPO2022 terrain at a single AR_DT and
+# AR_TERRAIN_SMOOTHING, for AR_RUN_HOURS of simulated time from 2025-12-07T12. Submit one job per
+# (Δt, smoothing) so the sweep runs in parallel (slurm/dt_sweep_precompile.batch first):
+#
+#     for dt in 15 30 45 60; do
+#         sbatch --job-name=ar-dt9e2-$dt --export=ALL,AR_DT=$dt,AR_CELLS_PER_DEGREE=9,AR_TERRAIN_SMOOTHING=2 slurm/dt_sweep.batch
+#     done
+#
+# Job names ar-dt<cpd>e<smoothing>-<Δt> are what analysis/dt_sweep_compare.jl looks for.
+#
+# Everything counted in steps is rescaled from seconds, so members differ only in Δt (and in the
+# host-decided acoustic substep count, which follows Δt): radiation every simulated hour, one
+# report + snapshot per simulated hour. Δt must divide 3600.
+cd "$SLURM_SUBMIT_DIR"
+
+# Sweep-private depot + portable CPU target: see slurm/dt_sweep_precompile.batch (submit it first).
+export JULIA_DEPOT_PATH="$HOME/.julia-dtsweep:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_CPU_TARGET="generic;haswell,clone_all"
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-6}
+export HDF5_USE_FILE_LOCKING=FALSE
+export TMPDIR="$SLURM_SUBMIT_DIR/reactant_dumps"
+mkdir -p "$TMPDIR"
+
+JULIA=~/.juliaup/bin/julia
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+DT=${AR_DT:?set AR_DT}
+CPD=${AR_CELLS_PER_DEGREE:-9}
+RUN_HOURS=${AR_RUN_HOURS:-24}
+PARENT_HOURS=$(( RUN_HOURS + 1 ))   # keep the exchanger's resident window off the last level
+(( 3600 % DT == 0 )) || { echo "AR_DT=$DT does not divide 3600"; exit 1; }
+PER_HOUR=$(( 3600 / DT ))
+# Optional spin-up (AR_SPINUP_HOURS at AR_SPINUP_DT, default 10 s) sheds the interpolated IC's
+# imbalance before Δt takes over; the total simulated time stays RUN_HOURS.
+SPINUP_HOURS=${AR_SPINUP_HOURS:-0}
+SPINUP_DT=${AR_SPINUP_DT:-10}
+SPINUP_STEPS=$(( SPINUP_HOURS * 3600 / SPINUP_DT ))
+STEPS=$(( (RUN_HOURS - SPINUP_HOURS) * PER_HOUR ))
+TERRAIN=${AR_TERRAIN:-etopo}   # etopo (real ETOPO2022, AR_TERRAIN_SMOOTHING binomial passes) or analytic ridge
+SMOOTHING=${AR_TERRAIN_SMOOTHING:-2}
+TAG=$([ "$TERRAIN" = analytic ] && echo "" || echo "_${TERRAIN}_s${SMOOTHING}")
+[ "$SPINUP_HOURS" -gt 0 ] && TAG="${TAG}_spin${SPINUP_HOURS}h"
+OUT=${AR_OUTPUT_FILE:-dtsweep/landfall_${CPD}cpd_dt${DT}_${RUN_HOURS}h${TAG}.jld2}
+mkdir -p "$(dirname "$OUT")"
+rm -f "$OUT"
+
+echo "=== [$(date -Is)] Δt=$DT s, ${CPD} cpd, terrain $TERRAIN (smoothing $SMOOTHING), ${RUN_HOURS} h = ${SPINUP_HOURS} h spin-up ($SPINUP_STEPS × ${SPINUP_DT} s) + $STEPS steps, output $OUT ==="
+AR_ARCH=cuda \
+AR_DOMAIN=${AR_DOMAIN:-landfall} \
+AR_TERRAIN=$TERRAIN \
+AR_TERRAIN_SMOOTHING=$SMOOTHING \
+AR_CELLS_PER_DEGREE=$CPD \
+AR_PARENT=era5 \
+AR_PARENT_HOURS=$PARENT_HOURS \
+AR_ERA5_REGION=${AR_ERA5_REGION:--170.5,-109.5,24.5,60.5} \
+AR_PARENT_UNIFORM_Z=1 \
+AR_PARENT_PRESSURE=hydrostatic \
+AR_IC=interpolated \
+AR_BALANCER=0 \
+AR_COUPLED=${AR_COUPLED:-1} \
+AR_FLUX_ITERATIONS=${AR_FLUX_ITERATIONS:-10} \
+AR_RADIATION=${AR_RADIATION:-1} \
+AR_RADIATION_EVERY=$PER_HOUR \
+AR_SOLAR_COS_ZENITH=${AR_SOLAR_COS_ZENITH:-0} \
+AR_DT=$DT \
+AR_SPINUP_STEPS=$SPINUP_STEPS \
+AR_SPINUP_DT=$SPINUP_DT \
+AR_STEPS=$STEPS \
+AR_CHUNK=$PER_HOUR \
+AR_SPONGE=1 \
+AR_OUTPUT=1 \
+AR_OUTPUT_FILE=$OUT \
+    stdbuf -oL -eL $JULIA --startup-file=no --project=. -t auto reactant_downscale.jl
+status=$?
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status
