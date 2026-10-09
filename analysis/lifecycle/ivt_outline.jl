@@ -4,6 +4,7 @@ import Contour
 using SHA
 include("data.jl")
 using .LifecycleData: ERA5Series
+include("ivt_shading.jl")
 
 """Bracket a scan time with hourly analyses; never extrapolate."""
 function ivt_bracket(times,date)
@@ -45,7 +46,12 @@ function projected_ivt_outline(longitude,latitude,ivt,threshold,project)
     points
 end
 
-function make_ivt_overlay(; directory=get(ENV,"AR_LIFECYCLE_DATA",joinpath(@__DIR__,"data")))
+function make_ivt_overlay(; directory=get(ENV,"AR_LIFECYCLE_DATA",joinpath(@__DIR__,"data")),
+                           style=Symbol(get(ENV,"AR_IVT_STYLE","shaded")))
+    style in (:outline,:shaded) || error("AR_IVT_STYLE must be outline or shaded")
+    shaded = style == :shaded
+    line_width,line_opacity = shaded ? (2.5,0.95) : (0.8,0.60)
+    fill_opacity = shaded ? 0.10 : 0.0
     config = movie_config(:water_vapor)
     series = ERA5Series(directory;first_day=Date(config.start),last_day=Date(config.stop))
     threshold = 250.0
@@ -68,27 +74,48 @@ function make_ivt_overlay(; directory=get(ENV,"AR_LIFECYCLE_DATA",joinpath(@__DI
         "time_policy"=>"Linear interpolation of east/north IVT components to actual GOES scan start; then hypot. No extrapolation.",
         "spatial_policy"=>"Contour at 250 on the native 0.25-degree ERA5 grid; project vertices into ABI geometry. No spatial smoothing.",
         "classification"=>"Threshold exceedance only, without length/width/duration criteria or event tracking.",
-        "gap_policy"=>"Hide the outline on the missing GOES scan card.",
-        "style"=>Dict("color"=>"#f2ce78","opacity"=>0.60,"line_width_figure_pixels"=>0.8,"fill"=>false),
+        "gap_policy"=>"Hide the outline and shading on the missing GOES scan card.",
+        "style"=>Dict("color"=>"#f2ce78","opacity"=>line_opacity,"line_width_figure_pixels"=>line_width,
+            "fill"=>shaded,"fill_opacity"=>fill_opacity,"halo_width_figure_pixels"=>shaded ? 3.8 : 0.0),
         "files"=>files)
+    if shaded
+        provenance["fill_policy"] = "At each display-mask pixel, invert the ABI projection and bilinearly sample the time-interpolated ERA5 IVT magnitude. Tint only IVT >=250 inside ERA5 coverage. Low-IVT holes and space remain transparent."
+        provenance["fill_display_grid"] = [1920,round(Int,1920*(config.bounds[4]-config.bounds[3])/(config.bounds[2]-config.bounds[1]))]
+    end
     function draw!(ax,projection)
         points = Observable(Point2f[])
-        # One fine unfilled line keeps the observed cloud texture unobstructed.
-        lines!(ax,points;color=("#f2ce78",0.60),linewidth=0.8)
-        (; points,label=Observable(""),project=(λ,φ)->scan_position(λ,φ,projection))
+        lookup = shaded ? ivt_shading_lookup(series.longitude,series.latitude,projection,config.bounds) : nothing
+        fill_pixels = shaded ? Observable(fill(RGBAf(0,0,0,0),lookup.size)) : nothing
+        if shaded
+            xmin,xmax,ymin,ymax = config.bounds
+            image!(ax,(xmin,xmax),(ymin,ymax),fill_pixels;interpolate=false)
+            # A restrained dark halo keeps the gold boundary visible over white clouds.
+            lines!(ax,points;color=(:black,0.35),linewidth=3.8)
+        end
+        lines!(ax,points;color=("#f2ce78",line_opacity),linewidth=line_width)
+        (; points,lookup,fill_pixels,label=Observable(""),project=(λ,φ)->scan_position(λ,φ,projection))
     end
     function update!(state,date;available=true)
         if !available
             state.points[] = Point2f[]
-            state.label[] = "IVT outline hidden during the satellite data gap"
+            if shaded
+                fill!(state.fill_pixels[],RGBAf(0,0,0,0))
+                notify(state.fill_pixels)
+            end
+            state.label[] = "IVT overlay hidden during the satellite data gap"
             return
         end
         sample = interpolated_ivt(series,date)
+        if shaded
+            shade_ivt!(state.fill_pixels[],state.lookup,sample.ivt,threshold,RGBAf(colorant"#f2ce78",fill_opacity))
+            notify(state.fill_pixels)
+        end
         state.points[] = projected_ivt_outline(series.longitude,series.latitude,sample.ivt,threshold,state.project)
         left = Dates.format(series.dates[sample.left],dateformat"dd u HH:MM")
         right = Dates.format(series.dates[sample.right],dateformat"dd u HH:MM")
-        state.label[] = "Faint gold: IVT = 250 kg m⁻¹ s⁻¹  •  ERA5 0.25°  •  interpolated between $left and $right UTC"
+        legend = shaded ? "Gold boundary + light tint: IVT ≥ 250 kg m⁻¹ s⁻¹" : "Faint gold: IVT = 250 kg m⁻¹ s⁻¹"
+        state.label[] = "$legend  •  ERA5 0.25°  •  interpolated between $left and $right UTC"
     end
     credit = "NOAA GOES-18 + ERA5  •  IVT coverage: 15–65°N, 140°E–110°W  •  Threshold regions are not tracked AR events  •  Julia / AtmosphericRivers.jl"
-    (; suffix="_ivt250",draw!,update!,credit,provenance)
+    (; suffix=shaded ? "_ivt250_shaded" : "_ivt250",draw!,update!,credit,provenance)
 end

@@ -1,5 +1,5 @@
 # julia --project=analysis/lifecycle analysis/lifecycle/animate_goes_ivt.jl
-# Always writes a separate *_ivt250 movie, preview, and provenance.
+# Writes *_ivt250_shaded. AR_IVT_STYLE=outline reproduces the earlier *_ivt250 version.
 using NCDatasets
 include("animate_goes.jl")
 include("ivt_outline.jl")

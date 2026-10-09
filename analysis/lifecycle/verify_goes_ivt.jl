@@ -1,7 +1,9 @@
 using CairoMakie, JSON3, TOML, Dates, Test
 const FFMPEG = CairoMakie.Makie.FFMPEG_jll
 output = get(ENV,"AR_GOES_OUTPUT",joinpath(@__DIR__,"output"))
-stem = "goes18_water_vapor_ivt250"
+style = get(ENV,"AR_IVT_STYLE","shaded")
+style in ("shaded","outline") || error("Unknown IVT style")
+stem = "goes18_water_vapor_ivt250" * (style == "shaded" ? "_shaded" : "")
 movie = joinpath(output,stem * ".mp4")
 manifest = TOML.parsefile(joinpath(output,stem * "_provenance.toml"))
 original = TOML.parsefile(joinpath(output,"goes18_water_vapor_provenance.toml"))
@@ -25,6 +27,11 @@ probe = JSON3.read(read(`$(FFMPEG.ffprobe()) -v error -select_streams v:0 -count
     @test ivt["threshold_kg_m-1_s-1"] == 250
     @test ivt["grid_degrees"] == 0.25
     @test ivt["cadence_minutes"] == 60
+    @test ivt["style"]["fill"] == (style == "shaded")
+    if style == "shaded"
+        @test ivt["style"]["fill_opacity"] == 0.10
+        @test ivt["style"]["line_width_figure_pixels"] == 2.5
+    end
     @test ivt["latitude_bounds_degrees_north"] == [15,65]
     @test ivt["longitude_bounds_degrees_east"] == [140,250]
     @test length(ivt["files"]) == 7

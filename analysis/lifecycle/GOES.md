@@ -10,6 +10,7 @@ movie shows the fine daylight cloud structure at landfall on December 8.
 | `goes18_water_vapor.mp4` | ABI band 9, 6.9 µm, full disk | 2 km at nadir; 10-minute scans | Dec 6 00:00–Dec 11 23:50 UTC scan slots |
 | `goes18_visible_landfall.mp4` | ABI band 2, 0.64 µm, Pacific CONUS sector | 500 m at nadir; 5-minute scans | Dec 8 18:00–23:55 UTC scan slots |
 | `goes18_water_vapor_ivt250.mp4` | Same band 9 imagery with a faint ERA5 IVT outline | GOES unchanged; hourly 0.25° ERA5 interpolated to scan times | Same six-day sequence |
+| `goes18_water_vapor_ivt250_shaded.mp4` | Same imagery with stronger IVT boundaries and very light high-IVT shading | Same ERA5 and GOES data | Same six-day sequence |
 
 The displayed timestamps are the **actual scan start times**, which have a small
 offset from these nominal slots. A scan takes time to acquire; it is not an
@@ -84,10 +85,10 @@ sweep-x geometry. They mark the surface; elevated cloud tops can have parallax.
 For quantitative moisture transport, the separate
 [ERA5 and hindcast animations](README.md) are useful companion diagnostics.
 
-## Add a subtle IVT threshold outline
+## Add an IVT boundary and light shading
 
-The optional outlined version is a **separate animation**. It preserves the
-satellite-only movies, previews, and provenance under their existing names.
+The optional IVT overlay is a **separate animation**. It preserves the
+satellite-only and earlier faint-outline movies under their existing names.
 
 ```sh
 # Reuse the ERA5 cache if it already exists. Otherwise download it once:
@@ -97,11 +98,17 @@ julia --project=analysis/lifecycle analysis/lifecycle/animate_goes_ivt.jl
 
 `AR_LIFECYCLE_DATA` selects the existing ERA5 cache. `AR_GOES_DATA`,
 `AR_GOES_OUTPUT`, and the preview settings above also apply. New files have the
-suffix `_ivt250`: the MP4, a development PNG, a `_landfall.png`, and a provenance
+suffix `_ivt250_shaded`: the MP4, a development PNG, a `_landfall.png`, and a provenance
 file. The movie retains the same 864 frames, 72-second duration, and scan times.
+Set `AR_IVT_STYLE=outline` when rendering or verifying to reproduce the earlier
+thin, unfilled version with the `_ivt250` suffix. The default is `shaded`.
 
-The unfilled, fine, translucent gold line is **IVT = 250 kg m⁻¹ s⁻¹**, a common
+The gold line is **IVT = 250 kg m⁻¹ s⁻¹**, a common
 threshold for AR conditions. See the [CW3E AR scale](https://cw3e.ucsd.edu/arscale/).
+The new line is 2.5 figure pixels wide (5 pixels in the 4K export), with 95%
+opacity and a narrow dark halo to keep it readable against bright cloud tops.
+A **10%-opaque gold tint** identifies the high-IVT side. It leaves low-IVT holes
+unshaded, including holes inside an otherwise enclosed region.
 It outlines all threshold-exceeding regions in the ERA5 coverage, including
 separate corridors and small patches; it does not filter them into AR objects
 using length, width, orientation, or duration, or assign them to independent
@@ -116,14 +123,20 @@ smoothly without implying observed 10-minute IVT data. The bracketing analysis
 times are printed on every frame. No satellite frames are interpolated.
 
 Contours are extracted on the ERA5 longitude/latitude grid and their vertices
-are projected to the same ABI geometry as the imagery. No spatial smoothing or
-filled shading is used. IVT coverage is **15–65°N, 140°E–110°W**; contours remain
+are projected to the same ABI geometry as the imagery. No spatial smoothing is
+used. The fill samples the same time-interpolated IVT magnitude bilinearly at a
+1920×893 display-mask grid in ABI coordinates and tints only values ≥250. This
+display mask does not increase ERA5's physical resolution. The geographic lookup
+rejects space and points outside the ERA5 domain, so fill cannot spill over the
+satellite limb or imply data beyond the available coverage.
+
+IVT coverage is **15–65°N, 140°E–110°W**; contours remain
 open where they reach that domain's boundary. A missing outline outside those
-bounds does not imply low IVT. The outline is hidden during the missing GOES scan
+bounds does not imply low IVT. Both the outline and fill are hidden during the missing GOES scan
 card. ERA5 files through December 12 supply the final interpolation bracket.
 
 The new provenance file records the ERA5 source and file hashes, interpolation
-method, threshold, coverage, and styling separately from the original satellite
+method, threshold, coverage, mask dimensions, and styling separately from the original satellite
 metadata. Check it with:
 
 ```sh

@@ -20,6 +20,33 @@ include("animate_goes_ivt.jl")
     @test only(interpolated_ivt(series,times[1]+Minute(30)).ivt) == 300
 end
 
+@testset "High-side shading, holes, and satellite limb" begin
+    projection = Dict("semi_major_axis"=>6378137.0,"semi_minor_axis"=>6356752.31414,
+        "perspective_point_height"=>35786023.0,"longitude_of_projection_origin"=>-137.0)
+    for (lon,lat) in [(-170.,30.),(-150.,60.),(-122.33,47.61)]
+        x,y = scan_position(lon,lat,projection)
+        λ,φ = ivt_geographic_position(x,y,projection)
+        @test λ ≈ lon atol=1e-8
+        @test φ ≈ lat atol=1e-8
+    end
+    @test all(isnan,ivt_geographic_position(0.15,0.15,projection))
+    lon,lat = [200.,201.,202.],[30.,31.,32.]
+    @test isnothing(ivt_bilinear_location(lon,lat,199.,31.))
+    @test isnothing(ivt_bilinear_location(lon,lat,201.,33.))
+    cells = [ivt_bilinear_location(lon,lat,λ,φ) for (λ,φ) in [(200.,30.),(201.,31.),(200.5,31.)]]
+    lookup = (pixels=Int32[1,2,3],indices=Int32[c.index for c in cells],
+              u=Float32[c.u for c in cells],v=Float32[c.v for c in cells],nx=3)
+    field = fill(400.,3,3); field[2,2] = 100
+    transparent,tint = RGBAf(0,0,0,0),RGBAf(colorant"#f2ce78",0.10)
+    pixels = fill(transparent,3,1)
+    shade_ivt!(pixels,lookup,field,250,tint)
+    @test pixels[1] == tint
+    @test pixels[2] == transparent # Low-IVT hole inside a surrounding high region.
+    @test pixels[3] == tint # Exactly on the threshold is included.
+    shade_ivt!(pixels,lookup,fill(100.,3,3),250,tint)
+    @test all(==(transparent),pixels) # No stale shading after the boundary moves.
+end
+
 @testset "Threshold geometry and disconnected features" begin
     x,y = collect(-4.0:0.025:4.0),collect(-2.0:0.025:2.0)
     field = [500max(exp(-((λ-2)^2+φ^2)/0.5),exp(-((λ+2)^2+φ^2)/0.5)) for λ in x, φ in y]
