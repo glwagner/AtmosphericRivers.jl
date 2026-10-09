@@ -3055,14 +3055,41 @@ if get(ENV, "AR_AD", "0") == "1"
     ##
     ## `AR_AD_FIRST_STEP=0` skips it, which is how job 4785's NaN was diagnosed — keep it for triage,
     ## not for results.
+    ## ### `AR_AD_SPINUP_STEPS`: settle the cold start at a small Δt before the long-Δt adjoint
+    ##
+    ## The interpolated ERA5 IC is unbalanced, and the opening step's ρw kick grows with Δt (−4.8,
+    ## −20.7, −38 for 10/30/40 s at 12 km): long steps blow up at the FIRST step, not in the steady
+    ## flow. So run `first_time_step!` and `AR_AD_SPINUP_STEPS` further steps at `AR_AD_SPINUP_DT`
+    ## (default 10 s), compiled forward-only and NOT differentiated, then differentiate at `AR_DT`.
+    ## The acoustic substep count stays the one shim 5 sized for `AR_DT`, i.e. MORE substeps than the
+    ## short spin-up steps need, which only costs time. The control then perturbs the state at
+    ## t = Δt_spin · (1 + AR_AD_SPINUP_STEPS), and the AD window must fit in what is left of
+    ## AR_PARENT_HOURS after it.
+    ad_spinup_steps = parse(Int, get(ENV, "AR_AD_SPINUP_STEPS", "0"))
+    Δt_first = ad_spinup_steps > 0 ? parse(FT, get(ENV, "AR_AD_SPINUP_DT", "10")) : Δt
+
     if get(ENV, "AR_AD_FIRST_STEP", "1") == "1"
-        stage("AD: compiling first_time_step! (outside the differentiated region)")
+        stage("AD: compiling first_time_step! at Δt = $(Δt_first) s (outside the differentiated region)")
         compile_start = time_ns()
         r_ad_first = @compile compile_options = ar_compile_options(raise = raise_option) first_time_step!(
-            model, Δt)
+            model, Δt_first)
         stage(@sprintf("AD: compiled first_time_step! in %.1f s", 1e-9 * (time_ns() - compile_start)))
-        r_ad_first(model, Δt)
+        r_ad_first(model, Δt_first)
         stage("AD: ran first_time_step!; the differentiated segment starts from the state it left")
+        report(model, 0.0)
+    end
+
+    if ad_spinup_steps > 0
+        stage("AD: compiling the spin-up loop ($(ad_spinup_steps) steps at Δt = $(Δt_first) s, forward only)")
+        compile_start = time_ns()
+        spinup_n = Reactant.ConcreteRNumber(ad_spinup_steps)
+        r_spinup = @compile compile_options = ar_compile_options(raise = raise_option) step_for!(
+            model, Δt_first, spinup_n)
+        stage(@sprintf("AD: compiled the spin-up loop in %.1f s", 1e-9 * (time_ns() - compile_start)))
+        spin_start = time_ns()
+        r_spinup(model, Δt_first, spinup_n)
+        stage(@sprintf("AD: spun up %d steps in %.1f s; t = %.0f s", ad_spinup_steps,
+                       1e-9 * (time_ns() - spin_start), host_number(breeze_child(model).clock.time)))
         report(model, 0.0)
     end
 
