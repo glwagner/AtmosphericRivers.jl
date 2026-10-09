@@ -46,9 +46,12 @@ of extra IWV₀₋₁ₖₘ spread over a 100 km × 100 km patch, which does not
 ## Running
 
 ```bash
-# gradient (AD block owned by reactant_downscale.jl; 1 day = 8640 steps at Δt = 10 s)
-AR_AD=1 AR_AD_LOSS=precipitation AR_AD_STEPS=8640 AR_PARENT_HOURS=25 AR_CELLS_PER_DEGREE=9 \
-    sbatch slurm/reactant_ad.batch            # start with shorter windows: 720,2160,4320
+# gradient (AD block owned by reactant_downscale.jl). Δt = the longest stable step (see the forward
+# run's MAX_DT); the window is nsteps = 86400/Δt. Precipitation is accumulated with the run's actual Δt
+# and the plot reads Δt and the step count from the file, so nothing here assumes a Δt.
+DT=<max stable Δt>; NSTEPS=$(( 86400 / DT ))
+AR_AD=1 AR_AD_LOSS=precipitation AR_DT=$DT AR_AD_STEPS=$NSTEPS AR_PARENT_HOURS=25 AR_CELLS_PER_DEGREE=9 \
+    sbatch slurm/reactant_ad.batch            # build up: windows of 2, 6, 12 h first
 
 # figure + diagnostics (login node)
 julia --project=sensitivity sensitivity/plot_sensitivity.jl <gradient.jld2> [out.png]

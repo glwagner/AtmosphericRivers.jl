@@ -112,7 +112,7 @@ let
         file["grid/lambda_face"] = λf; file["grid/phi_face"] = φf; file["grid/z_face"] = rf
         file["grid/terrain_height"] = h; file["grid/z_top"] = z_top
         file["ad/gradient"] = Float32.(g); file["ad/control_initial"] = Float32.(c)
-        file["ad/loss"] = sum(w .* P); file["ad/steps"] = 8640; file["ad/dt"] = 10.0; file["ad/accum_start"] = 0
+        file["ad/loss"] = sum(w .* P); file["ad/dt"] = 30.0; file["ad/steps"] = round(Int, 86400 / 30.0); file["ad/accum_start"] = 0
         file["sens/weights"] = w; file["sens/precip_accumulated"] = P; file["sens/dt_seconds"] = 10.0
         file["sens/region_polygon"] = TARGET_POLYGON
     end

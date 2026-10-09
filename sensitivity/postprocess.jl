@@ -50,8 +50,8 @@
 #
 # ## Caveat on t₀
 #
-# reactant_downscale.jl writes the control AFTER `first_time_step!`, so "initial" means t = Δt (10 s
-# after the ERA5 initial condition). Irrelevant for a 1-day window.
+# reactant_downscale.jl writes the control AFTER `first_time_step!`, so "initial" means t = Δt (one
+# step after the ERA5 initial condition). Irrelevant for a 1-day window.
 
 """
     layer_fractions(r_faces, h, z_top; H = 1000)
