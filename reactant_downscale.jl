@@ -1712,6 +1712,26 @@ end
 
 Δt = parse(FT, get(ENV, "AR_DT", "10"))
 
+## ### Shim 13: AIVA's adaptive split step under a traced clock
+##
+## `AdaptiveVerticallyImplicitDiscretization` keeps its split time step in a host `Ref{FT}` and
+## refreshes it every stage from the clock (`update_adaptive_timestep!`): `td.Δt[] = β_stage · Δt`.
+## Under Reactant the clock's times are traced, so that store is `Float32(::TracedRNumber)` — a
+## `MethodError` while tracing the first step (job 2314). At a FIXED Δt the value is known on the host:
+## the stage index is a plain `Int` that the trace unrolls, so bake `stage_fraction(ts, stage) · Δt`
+## in per stage. `AIVA_HOST_DT[]` is set to the Δt about to be compiled (spin-up vs AD sweep); a
+## traced Δt schedule cannot use this and keeps the last value baked in.
+const AIVA_HOST_DT = Ref{Float64}(Δt)
+if !VANILLA
+    @eval function Oceananigans.Advection.update_adaptive_timestep!(
+            scheme::Oceananigans.Advection.AdaptiveImplicitVerticalAdvection,
+            model::Breeze.AtmosphereModel{<:Any, <:Any, <:ReactantState})
+        td = Oceananigans.TimeSteppers.time_discretization(scheme)
+        td.Δt[] = Breeze.TimeSteppers.stage_fraction(model.timestepper, model.clock.stage) * AIVA_HOST_DT[]
+        return nothing
+    end
+end
+
 acoustic_cfl = parse(FT, get(ENV, "AR_ACOUSTIC_CFL", "0.5"))
 thermodynamic_constants = Breeze.ThermodynamicConstants(FT)
 
@@ -3164,6 +3184,7 @@ if get(ENV, "AR_AD", "0") == "1"
     Δt_first = ad_spinup_steps > 0 ? parse(FT, get(ENV, "AR_AD_SPINUP_DT", "10")) : Δt
 
     if get(ENV, "AR_AD_FIRST_STEP", "1") == "1"
+        AIVA_HOST_DT[] = Δt_first
         stage("AD: compiling first_time_step! at Δt = $(Δt_first) s (outside the differentiated region)")
         compile_start = time_ns()
         r_ad_first = @compile compile_options = ar_compile_options(raise = raise_option) first_time_step!(
@@ -3175,6 +3196,7 @@ if get(ENV, "AR_AD", "0") == "1"
     end
 
     if ad_spinup_steps > 0
+        AIVA_HOST_DT[] = Δt_first
         stage("AD: compiling the spin-up loop ($(ad_spinup_steps) steps at Δt = $(Δt_first) s, forward only)")
         compile_start = time_ns()
         spinup_n = Reactant.ConcreteRNumber(ad_spinup_steps)
@@ -3340,6 +3362,7 @@ if get(ENV, "AR_AD", "0") == "1"
     ## no `first_time_step!`, so it enters RK3 straight from an unbalanced initial condition); finite
     ## here with NaN from the sweep means the augmented forward is.
     if get(ENV, "AR_AD_PRIMAL_ONLY", "0") == "1"
+        AIVA_HOST_DT[] = Δt
         stage("AD: AR_AD_PRIMAL_ONLY=1 — compiling the LOSS only (no Enzyme)")
         compile_start = time_ns()
         r_ad_loss = @compile compile_options = ar_compile_options(
@@ -3475,6 +3498,7 @@ if get(ENV, "AR_AD", "0") == "1"
         exit(0)
     end
 
+    AIVA_HOST_DT[] = Δt
     stage("AD: compiling the reverse sweep (raise_first = $(AD_RAISE_FIRST)) — ONE compile for every window")
     compile_start = time_ns()
     r_ad_gradient! = @compile compile_options = ar_compile_options(
