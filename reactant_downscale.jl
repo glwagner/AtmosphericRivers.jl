@@ -1731,11 +1731,20 @@ damping_depth = breeze_extension.default_lid_depth(host_grid)
 sponge = get(ENV, "AR_SPONGE", "1") == "1" ?
     UpperSponge(damping_rate = 1/5, depth = damping_depth) : nothing
 
+## `AR_DIVERGENCE_DAMPING=α` (> 0) turns on Breeze's Klemp–Skamarock–Ha acoustic divergence damping
+## (`ThermalDivergenceDamping`, Breeze's own default at α = 0.1; explicit bound α ≤ 0.25) in place of
+## the NumericalEarth nest default `NoDivergenceDamping()`, which leaves only the off-centred vertical
+## solve to damp acoustic noise. A time-step-sweep knob: default 0 keeps the established behaviour.
+divergence_damping_coefficient = parse(FT, get(ENV, "AR_DIVERGENCE_DAMPING", "0"))
+acoustic_damping = divergence_damping_coefficient > 0 ?
+    Breeze.CompressibleEquations.ThermalDivergenceDamping(; coefficient = divergence_damping_coefficient) :
+    NoDivergenceDamping()
+
 nested_time_discretization = SplitExplicitTimeDiscretization(FT;
                                                              substeps = acoustic_substeps,
                                                              acoustic_cfl,
                                                              sponge,
-                                                             damping = NoDivergenceDamping())
+                                                             damping = acoustic_damping)
 
 ## Breeze 0.11 renamed the anchor `surface_pressure` → `base_pressure` (the reference pressure at
 ## z = 0; "surface pressure" now means the derived pressure at a column's ground). NumericalEarth
