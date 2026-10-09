@@ -75,6 +75,7 @@ AR_RADIATION=${AR_RADIATION:-0} \
 AR_SPONGE=${AR_SPONGE:-1} \
 AR_DT=$DT \
 AR_OUTPUT=1 \
+AR_OUTPUT_FILE=${AR_OUTPUT_FILE:-runs/sensitivity/snapshots_${SLURM_JOB_ID}.jld2} \
     stdbuf -oL -eL $JULIA --startup-file=no --project=. -t auto reactant_downscale.jl
 status=$?
 
