@@ -2072,6 +2072,15 @@ else
     analytic_names = filter(name -> haskey(analytic_prognostics, name), keys(prognostic_fields(child)))
     zeroed_names = filter(name -> !haskey(analytic_prognostics, name), keys(prognostic_fields(child)))
     stage("child initialized: analytic $(analytic_names), at rest $(zeroed_names)")
+
+    ## Writing prognostic fields directly leaves the diagnostics (temperature, pressure, …) unset.
+    ## The bare nest recomputes them on its first step, but the coupled model computes surface fluxes
+    ## from them FIRST, so without this every cell is NaN after one step under AR_ARCH=cuda. Not run
+    ## under Reactant, where an eager `update_state!` on the traced grid has not been tried.
+    if VANILLA
+        Oceananigans.TimeSteppers.update_state!(nest)
+        stage("analytic IC: diagnostics computed (update_state!)")
+    end
 end
 
 # ## Prescribed ocean surface (in place of the ERA5 SST snapshot)
