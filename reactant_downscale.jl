@@ -3689,6 +3689,13 @@ if adaptive_Δt
             n_before = length(dt_log.dt)
             while t < t_target - 0.05
                 τ = advective_timescale()
+                ## A non-finite timescale means the state already is: stop and keep the record.
+                if !isfinite(τ)
+                    stage(@sprintf("adaptive Δt: non-finite advective timescale at t = %.1f s after a %.2f s step",
+                                   t, isempty(dt_log.dt) ? NaN : last(dt_log.dt)))
+                    global worst_nonfinite = max(worst_nonfinite, 1)
+                    break
+                end
                 Δt_wizard = clamp(min(wizard_cfl * τ, wizard_max_change * Δt_wizard), wizard_min_Δt, wizard_max_Δt)
                 remaining = t_target - t
                 Δt_step = remaining ≤ Δt_wizard ? remaining :
