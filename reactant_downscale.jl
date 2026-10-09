@@ -1740,11 +1740,17 @@ acoustic_damping = divergence_damping_coefficient > 0 ?
     Breeze.CompressibleEquations.ThermalDivergenceDamping(; coefficient = divergence_damping_coefficient) :
     NoDivergenceDamping()
 
+## `AR_OPEN_BOUNDARY_RELAXATION=α` sets Breeze's per-substep relaxation of the outermost open-boundary
+## cell's ρ′, (ρθ)′ toward the prescribed wall value (Breeze default 0.5; must be in (0, 1], so ~0 is
+## "off"). It is applied every acoustic substep, so its total kick grows with the substep count.
+open_boundary_relaxation = parse(FT, get(ENV, "AR_OPEN_BOUNDARY_RELAXATION", "0.5"))
+
 nested_time_discretization = SplitExplicitTimeDiscretization(FT;
                                                              substeps = acoustic_substeps,
                                                              acoustic_cfl,
                                                              sponge,
-                                                             damping = acoustic_damping)
+                                                             damping = acoustic_damping,
+                                                             open_boundary_relaxation)
 
 ## Breeze 0.11 renamed the anchor `surface_pressure` → `base_pressure` (the reference pressure at
 ## z = 0; "surface pressure" now means the derived pressure at a column's ground). NumericalEarth
