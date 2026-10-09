@@ -90,8 +90,10 @@ end
 
 function animate_goes(mode; directory=get(ENV,"AR_GOES_DATA",joinpath(@__DIR__,"goes_data")),
                            output=get(ENV,"AR_GOES_OUTPUT",joinpath(@__DIR__,"output")),
-                           preview=get(ENV,"AR_GOES_PREVIEW","0")=="1")
+                           preview=get(ENV,"AR_GOES_PREVIEW","0")=="1", overlay=nothing)
     config = movie_config(mode)
+    !isnothing(overlay) && mode != :water_vapor && error("IVT overlay requires the water-vapour movie")
+    stem = config.stem * (isnothing(overlay) ? "" : overlay.suffix)
     files = cache_files(directory,config)
     isempty(files) && error("No cached GOES scans; run download_goes.jl first")
     preview_index = parse(Int,get(ENV,"AR_GOES_PREVIEW_INDEX","1"))
@@ -118,6 +120,7 @@ function animate_goes(mode; directory=get(ENV,"AR_GOES_DATA",joinpath(@__DIR__,"
     range_x = (first(firstscan.x)-dx/2,last(firstscan.x)+dx/2)
     range_y = (last(firstscan.y)-dy/2,first(firstscan.y)+dy/2)
     image!(ax,range_x,range_y,pixels;interpolate=false)
+    overlay_state = isnothing(overlay) ? nothing : overlay.draw!(ax,firstscan.projection)
     annotate_map!(ax,firstscan.projection,mode)
     caption = Observable("")
     Label(fig[4,1:2],caption;fontsize=18,font=:bold,halign=:left,tellwidth=false)
@@ -132,8 +135,10 @@ function animate_goes(mode; directory=get(ENV,"AR_GOES_DATA",joinpath(@__DIR__,"
     note = mode == :water_vapor ?
         "Cloud and mid-tropospheric moisture patterns; this channel does not measure total-column moisture or IVT." :
         "Native visible-band samples; pixel footprints grow away from nadir. Coastlines mark the surface beneath clouds."
-    Label(fig[5,1:4],note;fontsize=14,color="#a7bacb",halign=:left,tellwidth=false)
-    Label(fig[6,1:4],"NOAA GOES-18 ABI  •  December 2025  •  Original scan geometry  •  Julia / AtmosphericRivers.jl";
+    note_label = isnothing(overlay) ? note : overlay_state.label
+    Label(fig[5,1:4],note_label;fontsize=14,color=isnothing(overlay) ? "#a7bacb" : "#e2c785",halign=:left,tellwidth=false)
+    credit = isnothing(overlay) ? "NOAA GOES-18 ABI  •  December 2025  •  Original scan geometry  •  Julia / AtmosphericRivers.jl" : overlay.credit
+    Label(fig[6,1:4],credit;
           fontsize=13,color="#7e95a9",halign=:left,tellwidth=false)
     rowgap!(fig.layout,10)
     rowsize!(fig.layout,3,Relative(0.79))
@@ -145,11 +150,12 @@ function animate_goes(mode; directory=get(ENV,"AR_GOES_DATA",joinpath(@__DIR__,"
         date = scan_datetime(scan.start)
         time_label[] = Dates.format(date,dateformat"dd u yyyy  HH:MM") * " UTC"
         caption[] = scene_caption(date,mode)
+        isnothing(overlay) || overlay.update!(overlay_state,date)
         push!(sources,Dict("scan_start"=>scan.start,"scan_end"=>scan.stop,
                            "url"=>scan.url,"original_sha256"=>scan.hash))
     end
     set_scan!(firstscan)
-    save(joinpath(output,config.stem * ".png"),fig;px_per_unit=2)
+    save(joinpath(output,stem * ".png"),fig;px_per_unit=2)
     preview && return
     empty!(sources)
     dates = GOESData.key_time.(basename.(files))
@@ -164,7 +170,7 @@ function animate_goes(mode; directory=get(ENV,"AR_GOES_DATA",joinpath(@__DIR__,"
     fps = mode == :water_vapor ? 12 : 5
     @info "Rendering satellite movie" mode frames=length(expected) scans=length(files) fps
     flush(stderr)
-    record(fig,joinpath(output,config.stem * ".mp4"),eachindex(expected);
+    record(fig,joinpath(output,stem * ".mp4"),eachindex(expected);
            framerate=fps,px_per_unit=2,compression=18) do i
         date = expected[i]
         if haskey(by_slot,date)
@@ -176,9 +182,10 @@ function animate_goes(mode; directory=get(ENV,"AR_GOES_DATA",joinpath(@__DIR__,"
             time_label[] = Dates.format(date,dateformat"dd u yyyy  HH:MM") * " UTC"
             gap_label[] = "Scan unavailable in the NOAA archive"
             caption[] = "Data gap  /  no interpolated or repeated imagery"
+            isnothing(overlay) || overlay.update!(overlay_state,date;available=false)
         end
         if mode == :water_vapor && date == DateTime(2025,12,8,18)
-            save(joinpath(output,"goes18_water_vapor_landfall.png"),fig;px_per_unit=2)
+            save(joinpath(output,stem * "_landfall.png"),fig;px_per_unit=2)
         end
         if i % 36 == 0 || i == length(expected)
             @info "Rendered satellite frames" mode frame=i total=length(expected)
@@ -195,7 +202,13 @@ function animate_goes(mode; directory=get(ENV,"AR_GOES_DATA",joinpath(@__DIR__,"
         "quality_mask"=>"Keep DQF 0 (good) and 1 (conditionally usable); mask other values.",
         "display"=>mode == :visible ? "sqrt(clamp(reflectance/0.6,0,1)); fixed grayscale" : "Fixed 195–280 K custom enhancement",
         "scans"=>sources)
-    open(joinpath(output,config.stem * "_provenance.toml"),"w") do io
+    if !isnothing(overlay)
+        manifest["ivt_overlay"] = overlay.provenance
+        manifest["temporal_interpolation"] = true
+        manifest["satellite_temporal_interpolation"] = false
+        manifest["ivt_temporal_interpolation"] = true
+    end
+    open(joinpath(output,stem * "_provenance.toml"),"w") do io
         TOML.print(io,manifest)
     end
     @info "Satellite movie complete" mode output

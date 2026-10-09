@@ -26,6 +26,8 @@ For **high-resolution satellite movies**, see the
 [GOES-18 workflow](analysis/lifecycle/GOES.md): 10-minute, 2 km water-vapour imagery
 of offshore development through landfall, plus a 5-minute, 500 m visible-light
 close-up. All acquisition and rendering code is Julia. Resolutions are at nadir.
+An optional, separate movie adds a faint **250 kg m⁻¹ s⁻¹ IVT outline** from
+hourly ERA5 while preserving the satellite-only versions.
 
 For complementary moisture-transport diagnostics, the
 [ERA5 and hindcast workflow](analysis/lifecycle/README.md) combines hourly 0.25°

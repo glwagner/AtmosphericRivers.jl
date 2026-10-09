@@ -9,6 +9,7 @@ movie shows the fine daylight cloud structure at landfall on December 8.
 |---|---|---|---|
 | `goes18_water_vapor.mp4` | ABI band 9, 6.9 µm, full disk | 2 km at nadir; 10-minute scans | Dec 6 00:00–Dec 11 23:50 UTC scan slots |
 | `goes18_visible_landfall.mp4` | ABI band 2, 0.64 µm, Pacific CONUS sector | 500 m at nadir; 5-minute scans | Dec 8 18:00–23:55 UTC scan slots |
+| `goes18_water_vapor_ivt250.mp4` | Same band 9 imagery with a faint ERA5 IVT outline | GOES unchanged; hourly 0.25° ERA5 interpolated to scan times | Same six-day sequence |
 
 The displayed timestamps are the **actual scan start times**, which have a small
 offset from these nominal slots. A scan takes time to acquire; it is not an
@@ -82,6 +83,53 @@ sweep-x geometry. They mark the surface; elevated cloud tops can have parallax.
 
 For quantitative moisture transport, the separate
 [ERA5 and hindcast animations](README.md) are useful companion diagnostics.
+
+## Add a subtle IVT threshold outline
+
+The optional outlined version is a **separate animation**. It preserves the
+satellite-only movies, previews, and provenance under their existing names.
+
+```sh
+# Reuse the ERA5 cache if it already exists. Otherwise download it once:
+julia --project=analysis/lifecycle analysis/lifecycle/download_era5.jl
+julia --project=analysis/lifecycle analysis/lifecycle/animate_goes_ivt.jl
+```
+
+`AR_LIFECYCLE_DATA` selects the existing ERA5 cache. `AR_GOES_DATA`,
+`AR_GOES_OUTPUT`, and the preview settings above also apply. New files have the
+suffix `_ivt250`: the MP4, a development PNG, a `_landfall.png`, and a provenance
+file. The movie retains the same 864 frames, 72-second duration, and scan times.
+
+The unfilled, fine, translucent gold line is **IVT = 250 kg m⁻¹ s⁻¹**, a common
+threshold for AR conditions. See the [CW3E AR scale](https://cw3e.ucsd.edu/arscale/).
+It outlines all threshold-exceeding regions in the ERA5 coverage, including
+separate corridors and small patches; it does not filter them into AR objects
+using length, width, orientation, or duration, or assign them to independent
+events. Cloud patterns and the transport boundary need not coincide.
+
+The outline uses ERA5's native vertically integrated eastward/northward water-vapour
+flux fields on the 0.25° archive grid (underlying model resolution about 31 km).
+It therefore has lower spatial resolution than the satellite imagery. The two
+transport **components** are linearly interpolated between hourly analyses to the
+actual GOES scan start, then combined with `hypot`. This makes the contour move
+smoothly without implying observed 10-minute IVT data. The bracketing analysis
+times are printed on every frame. No satellite frames are interpolated.
+
+Contours are extracted on the ERA5 longitude/latitude grid and their vertices
+are projected to the same ABI geometry as the imagery. No spatial smoothing or
+filled shading is used. IVT coverage is **15–65°N, 140°E–110°W**; contours remain
+open where they reach that domain's boundary. A missing outline outside those
+bounds does not imply low IVT. The outline is hidden during the missing GOES scan
+card. ERA5 files through December 12 supply the final interpolation bracket.
+
+The new provenance file records the ERA5 source and file hashes, interpolation
+method, threshold, coverage, and styling separately from the original satellite
+metadata. Check it with:
+
+```sh
+julia --project=analysis/lifecycle analysis/lifecycle/test_ivt_outline.jl
+julia --project=analysis/lifecycle analysis/lifecycle/verify_goes_ivt.jl
+```
 
 ## Verification and sources
 
