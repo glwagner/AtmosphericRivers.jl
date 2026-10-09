@@ -1602,6 +1602,95 @@ if get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "hydrostatic"
         end
         copyto!(parent(parent_pressure), p_host)
     end
+elseif get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "column"
+    ## `AR_PARENT_PRESSURE=column`: the same hydrostatic integration, but PER COLUMN — each parent
+    ## column's own Tᵛ profile, anchored at that column's ERA5 mean-sea-level pressure at `start_date`
+    ## (the parent is flat, so z = 0 is sea level). The domain-mean profile above is horizontally
+    ## uniform while ERA5's temperature is not, so every boundary target ρ = p / (Rᵐ T) is out of
+    ## hydrostatic balance by ~T′/T̄ and the walls carry a horizontal pressure gradient that is not
+    ## ERA5's. Host-side and before any trace, so the Reactant path is unaffected. ERA5 only: the
+    ## anchor is read from the cached single-level file `AR_MSL_FILE_REGION` (default the
+    ## 0.25° −180…−110 × 20…62 box) by bilinear interpolation to the parent's cell centres.
+    get(ENV, "AR_PARENT", "analytic") == "era5" || error("AR_PARENT_PRESSURE=column needs AR_PARENT=era5")
+    let constants64 = Breeze.ThermodynamicConstants(Float64),
+        Rᵈ = Breeze.dry_air_gas_constant(constants64),
+        Rᵛ = Breeze.vapor_gas_constant(constants64),
+        halo = Oceananigans.Grids.halo_size(cpu_parent_grid),
+        Nk = length(parent_pressure_levels),
+        NCDatasets = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "NCDatasets")
+        Hx, Hy, Hz = halo
+
+        Tʰ  = Array(parent(T_parent[1]))
+        qᵛʰ = Array(parent(q_parent[1]))
+        qˡʰ = Array(parent(qᶜˡ_parent[1])) .+ Array(parent(qʳ_parent[1]))
+        qⁱʰ = Array(parent(qᶜⁱ_parent[1])) .+ Array(parent(qˢ_parent[1]))
+        Itot, Jtot, Ktot = size(Tʰ)
+        @assert Ktot == Nk + 2Hz
+
+        msl_box = get(ENV, "AR_MSL_FILE_REGION", "-180.0_-110.0_20.0_62.0")
+        msl_path = joinpath(era5_datadir, "mean_sea_level_pressure_ERA5HourlySingleLevel_" *
+                                          "$(Dates.format(start_date, "yyyy-mm-ddTHH"))_$(msl_box).nc")
+        msl_λ, msl_φ, msl = NCDatasets.NCDataset(msl_path) do ds
+            x = ds["msl"]
+            Float64.(ds["longitude"][:]), Float64.(ds["latitude"][:]),
+            Float64.(coalesce.(ndims(x) == 3 ? x[:, :, 1] : x[:, :], NaN))
+        end
+        ## Bilinear on the (ascending-or-not) 0.25° lat-lon grid; points are clamped into the box.
+        function msl_at(λ, φ)
+            λs = msl_λ[1] < msl_λ[end] ? msl_λ : reverse(msl_λ)
+            φs = msl_φ[1] < msl_φ[end] ? msl_φ : reverse(msl_φ)
+            M = msl
+            msl_λ[1] > msl_λ[end] && (M = reverse(M, dims = 1))
+            msl_φ[1] > msl_φ[end] && (M = reverse(M, dims = 2))
+            λ = clamp(λ, λs[1], λs[end]); φ = clamp(φ, φs[1], φs[end])
+            i = clamp(searchsortedlast(λs, λ), 1, length(λs) - 1)
+            j = clamp(searchsortedlast(φs, φ), 1, length(φs) - 1)
+            a = (λ - λs[i]) / (λs[i+1] - λs[i]); b = (φ - φs[j]) / (φs[j+1] - φs[j])
+            return (1 - a) * (1 - b) * M[i, j] + a * (1 - b) * M[i+1, j] +
+                   (1 - a) * b * M[i, j+1] + a * b * M[i+1, j+1]
+        end
+
+        λc = λnodes(cpu_parent_grid, Center(), Center(), Center())
+        φc = φnodes(cpu_parent_grid, Center(), Center(), Center())
+        zc_halo = znodes(cpu_parent_grid, Center(); with_halos = true)
+        zc_all = Float64[zc_halo[k] for k in firstindex(zc_halo):lastindex(zc_halo)]
+
+        p_host = similar(Tʰ)
+        Tᵛ = zeros(Ktot); p_col = zeros(Ktot)
+        k₀ = Hz + 1
+        anchors = Float64[]
+        for J in 1:Jtot, I in 1:Itot
+            i = clamp(I - Hx, 1, parent_Nx); j = clamp(J - Hy, 1, parent_Ny)
+            p₀ = msl_at(λc[i], φc[j]); push!(anchors, p₀)
+            ## Column Tᵛ with the exchanger's mixture gas constant; non-physical cells (unfilled
+            ## corners, below-ground garbage) take the nearest physical value above them.
+            for kk in 1:Ktot
+                k = clamp(kk, Hz + 1, Hz + Nk)
+                T = Tʰ[I, J, k]
+                Rᵐ = (1 - qᵛʰ[I, J, k] - qˡʰ[I, J, k] - qⁱʰ[I, J, k]) * Rᵈ + qᵛʰ[I, J, k] * Rᵛ
+                Tᵛ[kk] = (isfinite(T) && T > 100) ? T * Rᵐ / Rᵈ : NaN
+            end
+            for kk in Ktot-1:-1:1
+                isfinite(Tᵛ[kk]) || (Tᵛ[kk] = Tᵛ[kk+1])
+            end
+            for kk in 2:Ktot
+                isfinite(Tᵛ[kk]) || (Tᵛ[kk] = Tᵛ[kk-1])
+            end
+            p_col[k₀] = p₀ * exp(-g_std * zc_all[k₀] / (Rᵈ * Tᵛ[k₀]))
+            for kk in k₀+1:Ktot
+                p_col[kk] = p_col[kk-1] * exp(-g_std * (zc_all[kk] - zc_all[kk-1]) / (Rᵈ * (Tᵛ[kk-1] + Tᵛ[kk]) / 2))
+            end
+            for kk in k₀-1:-1:1
+                p_col[kk] = p_col[kk+1] * exp(+g_std * (zc_all[kk+1] - zc_all[kk]) / (Rᵈ * (Tᵛ[kk+1] + Tᵛ[kk]) / 2))
+            end
+            @views p_host[I, J, :] .= p_col
+        end
+        stage(@sprintf("parent pressure: AR_PARENT_PRESSURE=column — per-column hydrostatic from each column's Tᵛ, \
+                        anchored at ERA5 msl %s (anchor range %.0f–%.0f Pa); top-level p range %.0f–%.0f Pa",
+                       Dates.format(start_date, "yyyy-mm-ddTHH"), extrema(anchors)...,
+                       extrema(p_host[Hx+1:Hx+parent_Nx, Hy+1:Hy+parent_Ny, Hz+Nk])...))
+        copyto!(parent(parent_pressure), p_host)
+    end
 else
     stage("parent pressure: AR_PARENT_PRESSURE=isa — keeping the isothermal-288 K placeholder (hydrostatically \
            inconsistent with the parent temperature; expect the acoustic kick from the walls)")
@@ -3655,6 +3744,43 @@ else
 end
 
 worst_nonfinite = 0
+
+# `AR_BOUNDARY_PROBE=<file.jld2>` (eager CUDA only): write the child's state WITH halos — prognostics,
+# total density, diagnosed pressure, and every field of the reference state — before and after one
+# `first_time_step!`, plus physical heights, then exit. The halos carry the open-boundary values, so
+# the file shows the jump between the prescribed wall state and the first interior cells, and
+# (after − before)/Δt is the step-1 tendency at the frame.
+if haskey(ENV, "AR_BOUNDARY_PROBE")
+    VANILLA || error("AR_BOUNDARY_PROBE requires AR_ARCH=cuda")
+    probe_path = ENV["AR_BOUNDARY_PROBE"]
+    probe_child = breeze_child(model)
+    probe_fields() = merge(prognostic_fields(probe_child),
+                           (; ρ = probe_child.dynamics.total_density, p = probe_child.dynamics.pressure))
+    JLD2.jldopen(probe_path, "w") do file
+        file["dt"] = Float64(Δt)
+        file["halo"] = collect(Oceananigans.Grids.halo_size(host_grid))
+        file["size"] = collect(size(host_grid))
+        file["grid/lambda_center"] = Array(λnodes(host_grid, Center(), Center(), Center()))
+        file["grid/phi_center"] = Array(φnodes(host_grid, Center(), Center(), Center()))
+        write_physical_heights(file)
+        for (name, f) in pairs(probe_fields())
+            file["before/$name"] = Array(parent(f))
+        end
+        reference = probe_child.dynamics.reference_state
+        for name in propertynames(reference)
+            f = getproperty(reference, name)
+            f isa Oceananigans.Fields.AbstractField && (file["reference/$name"] = Array(parent(f)))
+        end
+    end
+    first_time_step!(model, Δt)
+    JLD2.jldopen(probe_path, "a+") do file
+        for (name, f) in pairs(probe_fields())
+            file["after/$name"] = Array(parent(f))
+        end
+    end
+    stage("AR_BOUNDARY_PROBE: wrote the before/after state with halos to $(probe_path)")
+    exit(0)
+end
 
 snapshot!(model) = write_output &&
     write_snapshot(output_path, model, host_number(model.clock.iteration), host_number(model.clock.time))
