@@ -1499,15 +1499,15 @@ if get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "hydrostatic"
             T̄ᵛ[k] = n > 0 ? acc / n : (k > 1 ? T̄ᵛ[k-1] : 288.15)
         end
 
-        ## Surface anchor: the dataset's domain-mean surface pressure over the child at the start
-        ## date (the same number `nested_atmosphere_model(grid, dataset)` anchors its reference to);
+        ## z = 0 anchor: the dataset's domain-mean mean-sea-level pressure over the child at the start
+        ## date (the same number `nested_atmosphere_model(grid, dataset)` uses for `base_pressure`);
         ## the analytic parent, and an ERA5 cache without that file, fall back to `p_std`.
         p_surface = p_std
         if get(ENV, "AR_PARENT", "analytic") == "era5"
             try
-                p_surface = Float64(breeze_extension.mean_surface_pressure(dataset, host_grid, start_date, era5_datadir))
+                p_surface = Float64(breeze_extension.mean_sea_level_pressure(dataset, host_grid, start_date, era5_datadir))
             catch err
-                @warn "hydrostatic parent pressure: could not read the ERA5 mean surface pressure; \
+                @warn "hydrostatic parent pressure: could not read the ERA5 mean sea-level pressure; \
                        anchoring at p_std = $(p_std) Pa instead" exception = (err, catch_backtrace())
             end
         end
@@ -1670,7 +1670,7 @@ host_substeps = Breeze.CompressibleEquations.compute_acoustic_substeps(host_grid
 acoustic_substeps = parse(Int, get(ENV, "AR_ACOUSTIC_SUBSTEPS", string(host_substeps)))
 
 ## Otherwise exactly `default_nested_dynamics(grid; …)`: an upper sponge over the lid, no divergence
-## damping, and the script's `surface_pressure`. Only `substeps` and `sponge` differ.
+## damping, and the script's `base_pressure`. Only `substeps` and `sponge` differ.
 ##
 ## `AR_SPONGE=0` drops the Rayleigh sponge. Breeze's `sponge_rhs`/`sponge_term_diag` are reached from
 ## `_build_vertical_rhs!` and the tridiagonal coefficients, and that kernel does not compile through
@@ -1691,9 +1691,8 @@ nested_time_discretization = SplitExplicitTimeDiscretization(FT;
                                                              damping = NoDivergenceDamping())
 
 ## Breeze 0.11 renamed the anchor `surface_pressure` → `base_pressure` (the reference pressure at
-## z = 0; "surface pressure" now means the derived pressure at a column's ground). NumericalEarth's
-## `nested_atmosphere_model` still accepts `surface_pressure` and bridges it; direct
-## `CompressibleDynamics` calls must use the new name.
+## z = 0; "surface pressure" now means the derived pressure at a column's ground). NumericalEarth
+## followed suit (#698), so `nested_atmosphere_model` takes `base_pressure` too.
 dynamics = CompressibleDynamics(nested_time_discretization; base_pressure = p_std)
 
 ## `@allowscalar` because regularizing the `Interpolated` lateral boundaries calls
@@ -1740,7 +1739,7 @@ nest = if NATIVE_PARENT
                             ## Passed explicitly so the anchor matches `dynamics` below, which was
                             ## built with it — otherwise this method derives its own from the
                             ## dataset's domain-mean surface pressure and the two disagree.
-                            surface_pressure = p_std,
+                            base_pressure = p_std,
                             clock = model_clock,
                             dynamics,
                             microphysics,
@@ -1752,7 +1751,7 @@ else
                                                      terrain = nothing,
                                                      relaxation_rate = 1/300,
                                                      relaxation_width = relax_width,
-                                                     surface_pressure = p_std,
+                                                     base_pressure = p_std,
                                                      clock = model_clock,
                                                      dynamics,
                                                      microphysics,
@@ -1858,15 +1857,26 @@ stage("nest built (exchanger window filled, open BCs + Davies forcing in place);
 # (dry-weighted momentum and energy, total-weighted vapor), so the interior initial state and the
 # parent-derived boundary values agree at the walls to interpolation error — the property the
 # interpolated IC exists to guarantee. What is skipped is `reset_reference_state!`: the dynamics keeps
-# the reference profile it was built with, anchored to `surface_pressure` above.
+# the reference profile it was built with, anchored to `base_pressure` above.
 
 constants = child.thermodynamic_constants
 pˢᵗ = child.dynamics.standard_pressure
 Rᵈ = Breeze.dry_air_gas_constant(constants)
 Rᵛ = Breeze.vapor_gas_constant(constants)
-cᵖᵈ = constants.dry_air.heat_capacity
-ℒˡ = constants.liquid.reference_latent_heat
-ℒⁱ = constants.ice.reference_latent_heat
+
+## The moisture prognostic's NAME comes from the microphysics (`ρqᵉ` for the 1-moment mixed-phase
+## scheme, `ρqᵛ` for others) — the same lookup `nested_atmosphere_model` uses to key its moisture
+## boundary condition, so the IC and the boundary target land on the same field. Hardcoding `ρqᵛ`
+## silently leaves the real moisture prognostic at zero.
+moisture_name = Breeze.moisture_prognostic_name(microphysics)
+
+## The exchanger hands the child precipitation-free air: under an equilibrium scheme (`ρqᵉ`) the
+## moisture slot carries vapor + CLOUD condensate, otherwise vapor alone, and θˡⁱ gives up latent heat
+## for exactly that condensate. Rain and snow still load the density (they are not dry gas).
+const equilibrium_moisture = moisture_name === :ρqᵉ
+
+@inline slot_cloud_liquid(λ, φ, z) = equilibrium_moisture ? cloud_liquid_specific_humidity(λ, φ, z, 0) : zero(z)
+@inline slot_cloud_ice(λ, φ, z)    = equilibrium_moisture ? cloud_ice_specific_humidity(λ, φ, z, 0) : zero(z)
 
 @inline function initial_density(λ, φ, z)
     T = air_temperature(λ, φ, z, 0)
@@ -1878,10 +1888,10 @@ end
 
 @inline function initial_potential_temperature(λ, φ, z)
     T = air_temperature(λ, φ, z, 0)
-    qˡ = liquid_specific_humidity(λ, φ, z, 0)
-    qⁱ = ice_specific_humidity(λ, φ, z, 0)
-    return breeze_extension.liquid_ice_potential_temperature(T, qˡ, qⁱ, isa_pressure(z), pˢᵗ,
-                                                             Rᵈ, cᵖᵈ, ℒˡ, ℒⁱ)
+    qᵛ = vapor_specific_humidity(λ, φ, z, 0)
+    return breeze_extension.liquid_ice_potential_temperature(T, qᵛ, slot_cloud_liquid(λ, φ, z),
+                                                             slot_cloud_ice(λ, φ, z), isa_pressure(z),
+                                                             pˢᵗ, constants)
 end
 
 @inline initial_total_humidity(λ, φ, z) = vapor_specific_humidity(λ, φ, z, 0) +
@@ -1891,15 +1901,10 @@ end
 ## ρᵈ = ρ (1 − qᵗ) is the prognostic density; momentum and energy are dry-weighted, vapor total-weighted.
 @inline initial_dry_density(λ, φ, z) = initial_density(λ, φ, z) * (1 - initial_total_humidity(λ, φ, z))
 
-## The moisture prognostic's NAME comes from the microphysics (`ρqᵉ` for the 1-moment mixed-phase
-## scheme, `ρqᵛ` for others) — the same lookup `nested_atmosphere_model` uses to key its moisture
-## boundary condition, so the IC and the boundary target land on the same field. Hardcoding `ρqᵛ`
-## silently leaves the real moisture prognostic at zero.
-moisture_name = Breeze.moisture_prognostic_name(microphysics)
-
-## Total-weighted vapor density, matching the exchanger's `ρqᵛ = ρ qᵛ` (which is what the lateral
+## Total-weighted moisture density, matching the exchanger's `ρqᵛᵉ = ρ qᵛᵉ` (which is what the lateral
 ## boundaries and the Davies relaxation drive this field toward).
-moisture_density(λ, φ, z) = initial_density(λ, φ, z) * vapor_specific_humidity(λ, φ, z, 0)
+moisture_density(λ, φ, z) = initial_density(λ, φ, z) *
+    (vapor_specific_humidity(λ, φ, z, 0) + slot_cloud_liquid(λ, φ, z) + slot_cloud_ice(λ, φ, z))
 
 analytic_prognostics = merge((ρᵈ = initial_dry_density,
                               ρθ = (λ, φ, z) -> initial_dry_density(λ, φ, z) *
@@ -1990,7 +1995,7 @@ elseif ic_mode === :interpolated
                                            terrain = nothing,
                                            relaxation_rate = 1/300,
                                            relaxation_width = relax_width,
-                                           surface_pressure = p_std,
+                                           base_pressure = p_std,
                                            clock = Clock(time = zero(FT)),
                                            dynamics = CompressibleDynamics(nested_time_discretization;
                                                                            base_pressure = p_std),
@@ -2863,7 +2868,7 @@ if get(ENV, "AR_AD", "0") == "1"
     const Enzyme = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "Enzyme")
 
     const AD_ALIASES = (density = :ρᵈ, u = :ρu, v = :ρv, w = :ρw, theta = :ρθ,
-                        moisture = :ρqᵉ, rain = :ρqʳ, snow = :ρqˢ)
+                        moisture = :ρqᵉ, rain = :ρqʳ, snow = :ρqˢⁿ)
 
     function ad_field_name(spec)
         key = Symbol(spec)
