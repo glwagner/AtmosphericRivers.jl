@@ -1868,9 +1868,16 @@ sponge = get(ENV, "AR_SPONGE", "1") == "1" ?
 ## the NumericalEarth nest default `NoDivergenceDamping()`, which leaves only the off-centred vertical
 ## solve to damp acoustic noise. A time-step-sweep knob: default 0 keeps the established behaviour.
 divergence_damping_coefficient = parse(FT, get(ENV, "AR_DIVERGENCE_DAMPING", "0"))
+## `AR_DIVERGENCE_DAMPING_VERTICAL=1` also folds the vertical part into the column tridiag
+## (`damp_vertical = true`).
 acoustic_damping = divergence_damping_coefficient > 0 ?
-    Breeze.CompressibleEquations.ThermalDivergenceDamping(; coefficient = divergence_damping_coefficient) :
+    Breeze.CompressibleEquations.ThermalDivergenceDamping(; coefficient = divergence_damping_coefficient,
+                                                           damp_vertical = get(ENV, "AR_DIVERGENCE_DAMPING_VERTICAL", "0") == "1") :
     NoDivergenceDamping()
+
+## `AR_FORWARD_WEIGHT=ω` sets the off-centring of the implicit vertical acoustic solve (Breeze default
+## 0.65; ω ∈ [0.5, 1], larger damps vertical acoustic modes more).
+acoustic_forward_weight = parse(FT, get(ENV, "AR_FORWARD_WEIGHT", "0.65"))
 
 ## `AR_OPEN_BOUNDARY_RELAXATION=α` sets Breeze's per-substep relaxation of the outermost open-boundary
 ## cell's ρ′, (ρθ)′ toward the prescribed wall value (Breeze default 0.5; must be in (0, 1], so ~0 is
@@ -1882,6 +1889,7 @@ nested_time_discretization = SplitExplicitTimeDiscretization(FT;
                                                              acoustic_cfl,
                                                              sponge,
                                                              damping = acoustic_damping,
+                                                             forward_weight = acoustic_forward_weight,
                                                              open_boundary_relaxation)
 
 ## Breeze 0.11 renamed the anchor `surface_pressure` → `base_pressure` (the reference pressure at
