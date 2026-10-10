@@ -1776,6 +1776,26 @@ else
     breeze_extension.default_nested_microphysics()
 end
 stage("microphysics: $(summary(microphysics))")
+
+# ## Turbulence closure (`AR_CLOSURE`, default `tke`)
+#
+# Without one the nest has no subgrid vertical mixing at all: the surface fluxes from the ocean
+# coupling land in the lowest cell and stay there, and nothing mixes momentum, heat or moisture through
+# the boundary layer. `tke` is Breeze's `TKEBasedTurbulenceClosure` — a CATKE-like vertical
+# eddy diffusivity with prognostic ρe, vertically implicit diffusion and sinks — which adds the tracer
+# ρe to the child. ρe needs no lateral or Davies target (zero-gradient walls) and starts at a small
+# positive e₀ = AR_TKE_INITIAL (m² s⁻², default 1e-3; at zero the √e diffusivities never switch on).
+# `build_closure` is the single place the mixing length and stability functions are chosen.
+closure_kind = get(ENV, "AR_CLOSURE", "tke")
+closure_kind in ("tke", "none") || error("AR_CLOSURE must be tke or none, got $(closure_kind)")
+
+build_closure(FT) = TKEBasedTurbulenceClosure(Oceananigans.TurbulenceClosures.VerticallyImplicitTimeDiscretization(), FT;
+                                              mixing_length = Breeze.TKEMixingLength(),
+                                              stability_functions = Breeze.ConstantStabilityFunctions())
+
+closure = closure_kind == "tke" ? build_closure(FT) : nothing
+initial_tke = parse(FT, get(ENV, "AR_TKE_INITIAL", "1e-3"))
+stage("turbulence closure: $(isnothing(closure) ? "none" : summary(closure))")
 explicit_scalar_advection = breeze_extension.default_nested_scalar_advection(microphysics)
 
 if aiva
@@ -1945,6 +1965,7 @@ nest = if NATIVE_PARENT
                             clock = model_clock,
                             dynamics,
                             microphysics,
+                            closure,
                             momentum_advection,
                             scalar_advection,
                             balancer = get(ENV, "AR_BALANCER", "0") == "1")
@@ -1957,6 +1978,7 @@ else
                                                      clock = model_clock,
                                                      dynamics,
                                                      microphysics,
+                                                     closure,
                                                      momentum_advection,
                                                      scalar_advection)
 end
@@ -2209,6 +2231,7 @@ elseif ic_mode === :interpolated
                                            drag_surface_temperature = twin_drag > 0 ?
                                                parse(FT, get(ENV, "AR_DRAG_TSFC", "285")) : nothing,
                                            microphysics,
+                                           closure,
                                            momentum_advection,
                                            scalar_advection)
         breeze_extension.initialize_nested_child!(cpu_nest, nothing, nothing, nothing; balancer)
@@ -2287,6 +2310,14 @@ else
         Oceananigans.TimeSteppers.update_state!(nest)
         stage("analytic IC: diagnostics computed (update_state!)")
     end
+end
+
+## Seed the TKE: every IC path above leaves ρe at zero (the parent carries no turbulence), and at
+## e = 0 the closure's √e diffusivities and shear production stay zero forever.
+if haskey(prognostic_fields(child), :ρe)
+    interior(prognostic_fields(child).ρe) .= initial_tke .* interior(prognostic_fields(child).ρᵈ)
+    VANILLA && Oceananigans.TimeSteppers.update_state!(nest)
+    stage("TKE seeded: ρe = $(initial_tke) m² s⁻² × ρᵈ")
 end
 
 # ## Prescribed ocean surface (in place of the ERA5 SST snapshot)
