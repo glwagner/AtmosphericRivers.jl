@@ -7,7 +7,7 @@
 #SBATCH --time=06:00:00
 #SBATCH --output=slurm/%x-%j.log
 
-# The hydrostatic-parent configuration (AR_PARENT_PRESSURE=hydrostatic) run for AR_PARENT_HOURS of
+# The ERA5-parent configuration (AR_PARENT_PRESSURE from the environment, else the script default `column`) run for AR_PARENT_HOURS of
 # real ERA5 forcing with Reactant out of the loop, twice: DFI balancer off, then on. The ERA5 read
 # comes from the cached CORRIDOR box, which holds 72 h of hourly levels from 2025-12-07T12; the landfall
 # box only has three. The parent grid itself is unchanged (landfall box + 1° padding); the read is
@@ -45,7 +45,6 @@ run_one () {
     AR_PARENT_HOURS=$HOURS \
     AR_ERA5_REGION=${AR_ERA5_REGION:--170.5,-109.5,24.5,60.5} \
     AR_PARENT_UNIFORM_Z=${AR_PARENT_UNIFORM_Z:-1} \
-    AR_PARENT_PRESSURE=hydrostatic \
     AR_IC=interpolated \
     AR_BALANCER=$balancer \
     AR_COUPLED=${AR_COUPLED:-1} \
