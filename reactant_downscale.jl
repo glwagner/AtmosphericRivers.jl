@@ -1995,7 +1995,8 @@ if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_FROZEN_K", "1") == "1" &&
         invoke(Oceananigans.TurbulenceClosures.compute_closure_fields!,
                Tuple{Any, Breeze.TurbulenceClosures.FlavorOfTKEClosure, Any},
                closure_fields, closure, model; parameters)
-        for f in values(closure_fields)
+        for name in fieldnames(typeof(closure_fields))
+            f = getfield(closure_fields, name)
             f isa Oceananigans.Fields.AbstractField || continue
             data = parent(f)
             data isa Reactant.TracedRArray && (data .= Reactant.Ops.ignore_derivatives(data))
