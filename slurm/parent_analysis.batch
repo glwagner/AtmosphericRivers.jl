@@ -1,0 +1,23 @@
+#!/bin/bash
+#SBATCH --job-name=ar-parent-analysis
+#SBATCH --partition=gpua100,gpua100largex4,gpua100largex4spot,gpuprod,gpuprodflex
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=80G
+#SBATCH --time=01:30:00
+#SBATCH --output=slurm/%x-%j.log
+# Parent comparison products: polygon J, box/band precipitation table + maps vs ERA5, and IVT/IWV vs ERA5.
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-parent:$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_CPU_TARGET="generic;haswell,clone_all"
+export HDF5_USE_FILE_LOCKING=FALSE
+P=$HOME/AtmosphericRivers-parent/env
+R=runs/parent
+J="$HOME/.juliaup/bin/julia --startup-file=no --project=$P"
+RUNS="hand-rolled=$R/landfall_9cpd_24h_dt10_handrolled.jld2 native=$R/landfall_9cpd_24h_dt10_native.jld2 boundary=$R/landfall_9cpd_24h_dt10_boundary.jld2"
+mkdir -p figures/parent
+$J analysis/parent_region_precip.jl $RUNS
+$J analysis/compare_precipitation.jl figures/parent/precip_parents_24h.png $RUNS
+for k in handrolled native boundary; do
+  $J analysis/diagnose_moisture.jl $R/landfall_9cpd_24h_dt10_$k.jld2 figures/parent/moisture_$k.png
+done

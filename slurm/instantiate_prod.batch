@@ -1,0 +1,27 @@
+#!/bin/bash
+#SBATCH --job-name=ar-instantiate-prod
+#SBATCH --partition=gpuprod
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=100G
+#SBATCH --time=03:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Instantiate + precompile the root project into the prod depot (~/.julia-prod, read-only
+# fallback to ~/.julia) once, on a GPU node so CUDA.jl's driver-dependent precompiles are real.
+# The run scripts then take AR_SKIP_SETUP=1.
+cd "$SLURM_SUBMIT_DIR"
+
+export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
+mkdir -p "$HOME/.julia-prod"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+JULIA=~/.juliaup/bin/julia
+echo "=== [$(date -Is)] instantiate + precompile ==="
+$JULIA --startup-file=no --project=. -e '
+    using Pkg; Pkg.instantiate(); Pkg.precompile(); Pkg.status()
+    using CUDA; CUDA.versioninfo()'
+status=$?
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status

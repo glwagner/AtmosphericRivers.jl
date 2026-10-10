@@ -136,8 +136,15 @@ using CloudMicrophysics          # nested_atmosphere_model's default 1-moment mi
 using RRTMGP                     # Breeze's radiative-transfer extension
 using Reactant
 using CUDA                       # Reactant needs CUDA.jl loaded to raise KA kernels — on ANY backend
+## `AR_KERNEL_TUNING=1` / `AR_KERNEL_BLOCKS_PER_SM` / `AR_KERNEL_MAXREGS`: per-kernel register caps (launch bounds)
+## for the eager CUDA path — see perf/kernel_tuning.jl. Must load before the first kernel compiles.
+if any(k -> get(ENV, k, "") ∉ ("", "0"), ("AR_KERNEL_TUNING", "AR_KERNEL_BLOCKS_PER_SM", "AR_KERNEL_MAXREGS")) &&
+   !isdefined(Main, :tuned_launch_kwargs)
+    include(joinpath(@__DIR__, "perf", "kernel_tuning.jl"))
+end
 using Printf
 using Dates: DateTime, Hour   # `Hour` builds the ERA5 parent's 3-level hourly window
+import Dates                 # `Dates.format` for ERA5 file stamps
 
 using Oceananigans.Advection: AdaptiveVerticallyImplicitDiscretization
 using Oceananigans.Architectures: ReactantState, on_architecture
@@ -150,6 +157,20 @@ using NumericalEarth.NestedModels: NestedModel
 using Reactant: @code_hlo, @compile, @jit, @trace
 
 include("case.jl")
+
+# ## `AR_FUSED_HALOS` (default 1): fused tuple halo filling
+#
+# With an Oceananigans that has fused tuple halo filling (`Fields.FUSED_HALO_FILLING`, the
+# opt/halo-fusion branch), `fill_halo_regions!` on a tuple of fields launches one kernel per
+# side-pair for every run of fields whose boundary conditions are "local" — read only their own
+# data — instead of one launch per field per side-pair. NumericalEarth's parent lateral-BC
+# condition `Interpolated` reads only its own parent FieldTimeSeries, so it is declared local here.
+# `AR_FUSED_HALOS=0` restores the per-field path (bitwise-identical results).
+if isdefined(Oceananigans.BoundaryConditions, :halo_condition_locality)
+    Oceananigans.BoundaryConditions.halo_condition_locality(::NumericalEarth.NestedModels.Interpolated) =
+        Oceananigans.BoundaryConditions.LocalHalo()
+    Oceananigans.Fields.FUSED_HALO_FILLING[] = get(ENV, "AR_FUSED_HALOS", "1") == "1"
+end
 
 ## AR_BACKEND=gpu compiles for the GPU (the cluster case); "cpu" keeps everything host-side, which
 ## is what makes this script runnable on a laptop.
@@ -199,7 +220,18 @@ const VANILLA = get(ENV, "AR_ARCH", "reactant") == "cuda"
 #
 # This method also OWNS the initial condition (`initialize_nested_child!` runs inside it), so the
 # `AR_IC` branch below is skipped — `AR_BALANCER` still selects whether the DFI balance runs.
-const NATIVE_PARENT = get(ENV, "AR_NATIVE_PARENT", "0") == "1"
+#
+# `AR_PARENT_KIND` picks the parent explicitly (default `handrolled`, the one built below):
+#   * `native`   — NumericalEarth's full-domain `PrescribedAtmosphere` over the padded child box;
+#   * `boundary` — NumericalEarth #750's `BoundaryPrescribedAtmosphere`: the parent held only on four
+#                  strips covering the boundary and relaxation zone, the Davies relaxation launched over
+#                  those strips only, and the IC interpolated from a two-date full-domain snapshot.
+# Both use ERA5's true per-column geopotential levels over `AR_PARENT_HOURS + 1` hourly dates.
+# `AR_NATIVE_PARENT=1` remains a synonym for `AR_PARENT_KIND=native`.
+const PARENT_KIND = Symbol(get(ENV, "AR_PARENT_KIND", get(ENV, "AR_NATIVE_PARENT", "0") == "1" ? "native" : "handrolled"))
+PARENT_KIND in (:handrolled, :native, :boundary) ||
+    error("AR_PARENT_KIND must be handrolled, native or boundary, got $(PARENT_KIND)")
+const NATIVE_PARENT = PARENT_KIND !== :handrolled
 
 ## Skipped under AR_ARCH=cuda: this initializes an XLA GPU client, which reserves device memory that
 ## CUDA.jl would then be competing with for no reason — nothing is compiled through XLA in that mode.
@@ -346,6 +378,15 @@ end
 
 breeze_extension = Base.get_extension(NumericalEarth, :NumericalEarthBreezeExt)
 
+## `AR_FT_FORCING=1` also builds the atmosphere–ocean similarity-theory parameters at the atmosphere's own
+## float type: NumericalEarth hard-codes `AtmosphereThermodynamicsParameters(Float64)` for a Breeze
+## atmosphere, which makes the coupled-flux kernel (`compute_atmosphere_ocean_interface_state`) ~2400
+## f64 instructions long. Upstream fix: `AtmosphereThermodynamicsParameters(eltype(atmos.grid))`.
+if get(ENV, "AR_FT_FORCING", "0") == "1"
+    @eval NumericalEarth.EarthSystemModels.thermodynamics_parameters(atmos::Breeze.AtmosphereModel) =
+        NumericalEarth.Atmospheres.AtmosphereThermodynamicsParameters(eltype(atmos.grid))
+end
+
 ## 1. Move Breeze's terrain-following vertical coordinate onto Reactant. `on_architecture` for a
 ##    `LatitudeLongitudeGrid` walks the grid's fields through the extension's private `_to_reactant`,
 ##    which knows about arrays and the static vertical only.
@@ -480,11 +521,18 @@ end
 ## 4. `time_step!(::NestedModel, Δt)` advances the parent by `Δt_parent = child.clock.time -
 ##    parent.clock.time` only `if Δt_parent > 0` — a traced comparison. A compiled run steps at a
 ##    fixed Δt, so parent and child clocks advance in lockstep and the guard is known to hold.
-const ReactantNestedModel = NestedModel{<:Any, <:Any, <:Any, <:Any, <:Any, <:ReactantState}
+##    NumericalEarth #750 added a `child_callbacks` field (and type parameter) to `NestedModel` — the
+##    boundary-strip relaxation runs through it — so the architecture is the 7th parameter there and
+##    the 6th before; the callbacks must be passed on as the upstream method does.
+const ReactantNestedModel = hasfield(NestedModel, :child_callbacks) ?
+    NestedModel{<:Any, <:Any, <:Any, <:Any, <:Any, <:Any, <:ReactantState} :
+    NestedModel{<:Any, <:Any, <:Any, <:Any, <:Any, <:ReactantState}
 
-function Oceananigans.TimeSteppers.time_step!(nest::ReactantNestedModel, Δt; kw...)
+nested_child_callbacks(nest) = hasfield(typeof(nest), :child_callbacks) ? nest.child_callbacks : ()
+
+function Oceananigans.TimeSteppers.time_step!(nest::ReactantNestedModel, Δt; callbacks = (), kw...)
     NumericalEarth.NestedModels.exchange_state!(nest.exchanger, nest.clock.time + Δt)
-    time_step!(nest.child, Δt; kw...)
+    time_step!(nest.child, Δt; callbacks = (callbacks..., nested_child_callbacks(nest)...), kw...)
     time_step!(nest.parent, Δt)
     return nothing
 end
@@ -664,7 +712,9 @@ end
 ##    guarantee either.
 ##
 ##    `AR_FMULADD_FIX=0` restores CUDACore's FMA override, for testing once enzymexla can lower it.
-if get(ENV, "AR_FMULADD_FIX", "1") == "1"
+##    Off by default under `AR_ARCH=cuda`: no Reactant kernel runs there, so the override would only
+##    de-fuse every stencil of the production run (≈2% of the GPU step on an A100, job 2266).
+if get(ENV, "AR_FMULADD_FIX", VANILLA ? "0" : "1") == "1"
     ## CUDACore is a transitive dependency (of CUDA.jl), so `import CUDACore` fails; reach it through
     ## the loaded-module table. `@device_override` is CUDACore's own macro, so evaluating inside that
     ## module resolves it, and the identical signature replaces the overlay entry in place.
@@ -787,7 +837,13 @@ end
 #
 # Upstream fix: either branch of this shim, applied at both sites.
 
-fts_union_fix = parse(Int, get(ENV, "AR_FTS_UNION_FIX", "1"))
+## `AR_FT_FORCING=1` keeps the nest's forcing parameters at the grid's float type: the FTS time weight is
+## narrowed (shim-11 mode 2 unless `AR_FTS_UNION_FIX` is set), and the Davies `relaxation_rate`, the lid
+## sponge's `damping_rate` and the `UpperSponge` rate become `Float32`. With the defaults these are `Float64`
+## and every forced tendency kernel (ρθ, ρu, ρv, ρqᵉ, ρw) and every open-boundary halo fill does its
+## time interpolation and relaxation in f64 (perf/PROFILE_REPORT.md item 16; agent OPT-KERNEL).
+ft_forcing = get(ENV, "AR_FT_FORCING", "0") == "1"
+fts_union_fix = parse(Int, get(ENV, "AR_FTS_UNION_FIX", ft_forcing ? "2" : "1"))
 
 if fts_union_fix != 0
     const OceanOutputReaders = Oceananigans.OutputReaders
@@ -960,6 +1016,34 @@ taper_degrees = terrain_blend_length / 111e3
     return coastal + cascades + interior
 end
 
+# ## `AR_TERRAIN=etopo`: real orography
+#
+# The ridges above are straight north–south bumps: the Coast Range at -123.9°, the Cascades at
+# -121.3°, no Olympics, no Willapa Hills, no Columbia Gorge. Fine for a configuration twin, wrong for
+# anything that cares WHERE rain falls. `AR_TERRAIN=etopo` instead regrids ETOPO2022 onto the child's
+# cell centres (land only, ocean → 0) and smooths it with `AR_TERRAIN_SMOOTHING` binomial passes
+# (default 2, as in `downscale.jl`) — done once on the host, so the Reactant path takes it too. The
+# same frame taper applies: the hand-rolled parent is flat, so the ground must reach 0 at the walls.
+# The ETOPO file must already be in NumericalEarth's scratchspace (~480 MB, downloaded otherwise).
+terrain_source = get(ENV, "AR_TERRAIN", "etopo")
+terrain_source in ("analytic", "etopo") || error("AR_TERRAIN must be analytic or etopo, got $(terrain_source)")
+
+if terrain_source == "etopo"
+    etopo_grid = LatitudeLongitudeGrid(CPU(); longitude, latitude, size = (Nx, Ny), halo = (5, 5),
+                                       topology = (Bounded, Bounded, Flat))
+    etopo_field = regrid_topography(etopo_grid; dataset = ETOPO2022())
+    smooth_topography!(etopo_field; passes = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2")))
+    const etopo_elevation = Array(interior(etopo_field, :, :, 1))
+    ## Nearest cell centre: every caller (materialize_terrain!, the SST land mask) evaluates at
+    ## centres of this same grid, so this is exact there.
+    @inline function orography(λ, φ)
+        i = clamp(round(Int, (λ - λ₁) / Δ + 0.5), 1, Nx)
+        j = clamp(round(Int, (φ - φ₁) / Δ + 0.5), 1, Ny)
+        return @inbounds etopo_elevation[i, j]
+    end
+    @info @sprintf("AR_TERRAIN=etopo: ETOPO2022 on the child grid, max %.0f m", maximum(etopo_elevation))
+end
+
 @inline function terrain_elevation(λ, φ)
     wall_distance = min(λ - λ₁, λ₂ - λ, φ - φ₁, φ₂ - φ)
     s = clamp(wall_distance / taper_degrees, 0, 1)
@@ -981,6 +1065,34 @@ host_grid = LatitudeLongitudeGrid(CPU();
 flat_terrain = get(ENV, "AR_FLAT_TERRAIN", "0") == "1"
 materialize_terrain!(host_grid, flat_terrain ? ((λ, φ) -> zero(λ)) : terrain_elevation)
 flat_terrain && @info "AR_FLAT_TERRAIN=1: orography zeroed (diagnostic; not a physical downscale)"
+
+# A native parent knows its own surface elevation, so the child's ground is the UNTAPERED orography
+# blended toward the parent's over the frame — what `nested_atmosphere_model(…; terrain)` does — rather
+# than tapered to zero as for the flat hand-rolled parent. Done here, on the host twin, before the grid
+# moves to the device, so the eager CUDA and the Reactant paths get identical terrain. The parent's
+# surface elevation comes from a two-date full-domain snapshot (the box the native parent reads).
+## The native parents read ERA5 through `download(::MetadataSet)`, whose method lives in the
+## CopernicusClimateDataStore extension (cached files make no requests; see the ERA5 block below).
+NATIVE_PARENT && get(ENV, "AR_LOAD_CDS", "1") == "1" && @eval import CopernicusClimateDataStore
+
+if NATIVE_PARENT && !flat_terrain
+    let ext = Base.get_extension(NumericalEarth, :NumericalEarthBreezeExt),
+        padding = parse(Float64, get(ENV, "AR_NATIVE_PADDING", "0.5")),
+        snapshot = PrescribedAtmosphere(BoundingBox(host_grid; padding), start_date:Hour(1):(start_date + Hour(1)),
+                                        ERA5HourlyPressureLevels(); architecture = CPU(), dir = era5_datadir),
+        elevation = Field{Center, Center, Nothing}(host_grid),
+        blend_width = ext.default_terrain_blend_width(host_grid, terrain_blend_length)
+
+        set!(elevation, (λ, φ) -> orography(λ, φ))
+        ## NumericalEarth #750 takes the parent's surface elevation; earlier versions the parent itself.
+        surface = isdefined(NumericalEarth.Atmospheres, :BoundaryPrescribedAtmosphere) ?
+                  NumericalEarth.surface_elevation(snapshot) : snapshot
+        ## `orography` is ETOPO already smoothed by AR_TERRAIN_SMOOTHING; don't smooth it twice.
+        smoothing = terrain_source == "etopo" ? 0 : parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2"))
+        ext.materialize_nested_terrain!(host_grid, elevation, surface, blend_width, smoothing)
+        @info @sprintf("native parent: child terrain blended toward the ERA5 surface over %d cells", blend_width)
+    end
+end
 
 # `AR_TERRAIN_PATCH=<file.jld2>`: write the terrain into an existing snapshot file and exit.
 #
@@ -1202,10 +1314,29 @@ parent_grid = LatitudeLongitudeGrid(arch;
 # slides its window eagerly exactly as in `downscale.jl`; under Reactant the window cannot move, so
 # a longer parent would still wrap after 2 h.
 parent_hours = parse(Int, get(ENV, "AR_PARENT_HOURS", "2"))
-(!VANILLA && parent_hours != 2) &&
-    @warn "AR_PARENT_HOURS=$parent_hours under Reactant: shim 2 pins the exchanger window, so the \
-           boundary forcing will still stop advancing after 2 h of model time"
 parent_times = collect(0.0:1hour:(parent_hours * 1hour))
+
+# ### Shim 2b: under Reactant, make the exchanger's resident window the WHOLE parent time axis
+#
+# Shim 2 freezes the exchanger window because a traced clock cannot decide when to slide it. With
+# NumericalEarth's default 3-level window that froze the boundary forcing after 2 h. A window that
+# holds every level never moves (`exchange_state!` pins `start = 1` when `window ≥ N`), and is filled
+# once at construction (`force = true`, eager), so freezing it is then EXACT for any run within
+# `AR_PARENT_HOURS`. The cost is memory: 8 derived fields × (AR_PARENT_HOURS + 1) levels on the parent
+# grid — ~1 GB for 24 h over the 1°-padded landfall box at 0.25°.
+if !VANILLA && parent_hours > 2
+    @eval breeze_extension function child_prognostic_field_time_series(parent_atmosphere; time_indices_in_memory = 3)
+        grid  = parent_atmosphere.temperature.grid
+        times = parent_atmosphere.temperature.times
+        window = length(times)
+        build() = FieldTimeSeries{Center, Center, Center}(grid, times;
+                                                          backend = PrognosticStateBackend(1, window),
+                                                          time_indexing = Cyclical())
+        return (ρᵈ = build(), ρu = build(), ρv = build(), ρθ = build(), ρqᵛᵉ = build(), θ = build(), u = build(), v = build())
+    end
+    @info "shim 2b: exchanger window = all $(length(parent_times)) parent levels ($(parent_hours) h of \
+           forcing); runs longer than that see the forcing clamp at the last level"
+end
 
 u_parent = FieldTimeSeries{Center, Center, Center}(parent_grid, parent_times)
 v_parent = FieldTimeSeries{Center, Center, Center}(parent_grid, parent_times)
@@ -1312,7 +1443,7 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
     ## `AR_ERA5_REGION="lon1,lon2,lat1,lat2"` reads a DIFFERENT (larger) cached box instead of the
     ## padded child box — the regrid below interpolates onto the parent grid either way. This is how
     ## a longer window is reached without a CDS download: the corridor box
-    ## (-170.5,-109.5,24.5,60.5) is cached hourly for 12 h where the landfall box has only 3 levels.
+    ## (-170.5,-109.5,24.5,60.5) is cached hourly for 72 h (Dec 7 12Z to Dec 10 12Z) where the landfall box has only 3 levels.
     era5_region = if haskey(ENV, "AR_ERA5_REGION")
         r = parse.(Float64, split(ENV["AR_ERA5_REGION"], ','))
         length(r) == 4 || error("AR_ERA5_REGION needs lon1,lon2,lat1,lat2")
@@ -1445,7 +1576,7 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
     end
 end
 
-# ## `AR_PARENT_PRESSURE` (default `hydrostatic`): a parent pressure the parent's own temperature can hold up
+# ## `AR_PARENT_PRESSURE` (`column` for ERA5, else `hydrostatic`): a parent pressure the parent's own temperature can hold up
 #
 # The placeholder above pairs every parent level with the pressure of an ISOTHERMAL 288.15 K column
 # at that height — the same map that placed the levels. The exchanger then forms the child's
@@ -1467,7 +1598,12 @@ end
 # arithmetic vertical index are unaffected.
 #
 # `AR_PARENT_PRESSURE=isa` keeps the isothermal placeholder, i.e. reproduces the old behaviour.
-if get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "hydrostatic"
+## Default `column` for the ERA5 parent (per-column balance; the domain-mean profile left every wall out of
+## balance by ~T′/T̄ — a 6× larger step-1 frame kick, DT_SWEEP.md), `hydrostatic` for the analytic parent,
+## which has no msl field to anchor columns on.
+parent_pressure_mode = get(ENV, "AR_PARENT_PRESSURE",
+                           get(ENV, "AR_PARENT", "analytic") == "era5" ? "column" : "hydrostatic")
+if parent_pressure_mode == "hydrostatic"
     let constants64 = Breeze.ThermodynamicConstants(Float64),
         Rᵈ = Breeze.dry_air_gas_constant(constants64),
         Rᵛ = Breeze.vapor_gas_constant(constants64),
@@ -1553,6 +1689,95 @@ if get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "hydrostatic"
         end
         copyto!(parent(parent_pressure), p_host)
     end
+elseif parent_pressure_mode == "column"
+    ## `AR_PARENT_PRESSURE=column`: the same hydrostatic integration, but PER COLUMN — each parent
+    ## column's own Tᵛ profile, anchored at that column's ERA5 mean-sea-level pressure at `start_date`
+    ## (the parent is flat, so z = 0 is sea level). The domain-mean profile above is horizontally
+    ## uniform while ERA5's temperature is not, so every boundary target ρ = p / (Rᵐ T) is out of
+    ## hydrostatic balance by ~T′/T̄ and the walls carry a horizontal pressure gradient that is not
+    ## ERA5's. Host-side and before any trace, so the Reactant path is unaffected. ERA5 only: the
+    ## anchor is read from the cached single-level file `AR_MSL_FILE_REGION` (default the
+    ## 0.25° −180…−110 × 20…62 box) by bilinear interpolation to the parent's cell centres.
+    get(ENV, "AR_PARENT", "analytic") == "era5" || error("AR_PARENT_PRESSURE=column needs AR_PARENT=era5")
+    let constants64 = Breeze.ThermodynamicConstants(Float64),
+        Rᵈ = Breeze.dry_air_gas_constant(constants64),
+        Rᵛ = Breeze.vapor_gas_constant(constants64),
+        halo = Oceananigans.Grids.halo_size(cpu_parent_grid),
+        Nk = length(parent_pressure_levels),
+        NCDatasets = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "NCDatasets")
+        Hx, Hy, Hz = halo
+
+        Tʰ  = Array(parent(T_parent[1]))
+        qᵛʰ = Array(parent(q_parent[1]))
+        qˡʰ = Array(parent(qᶜˡ_parent[1])) .+ Array(parent(qʳ_parent[1]))
+        qⁱʰ = Array(parent(qᶜⁱ_parent[1])) .+ Array(parent(qˢ_parent[1]))
+        Itot, Jtot, Ktot = size(Tʰ)
+        @assert Ktot == Nk + 2Hz
+
+        msl_box = get(ENV, "AR_MSL_FILE_REGION", "-180.0_-110.0_20.0_62.0")
+        msl_path = joinpath(era5_datadir, "mean_sea_level_pressure_ERA5HourlySingleLevel_" *
+                                          "$(Dates.format(start_date, "yyyy-mm-ddTHH"))_$(msl_box).nc")
+        msl_λ, msl_φ, msl = NCDatasets.NCDataset(msl_path) do ds
+            x = ds["msl"]
+            Float64.(ds["longitude"][:]), Float64.(ds["latitude"][:]),
+            Float64.(coalesce.(ndims(x) == 3 ? x[:, :, 1] : x[:, :], NaN))
+        end
+        ## Bilinear on the (ascending-or-not) 0.25° lat-lon grid; points are clamped into the box.
+        function msl_at(λ, φ)
+            λs = msl_λ[1] < msl_λ[end] ? msl_λ : reverse(msl_λ)
+            φs = msl_φ[1] < msl_φ[end] ? msl_φ : reverse(msl_φ)
+            M = msl
+            msl_λ[1] > msl_λ[end] && (M = reverse(M, dims = 1))
+            msl_φ[1] > msl_φ[end] && (M = reverse(M, dims = 2))
+            λ = clamp(λ, λs[1], λs[end]); φ = clamp(φ, φs[1], φs[end])
+            i = clamp(searchsortedlast(λs, λ), 1, length(λs) - 1)
+            j = clamp(searchsortedlast(φs, φ), 1, length(φs) - 1)
+            a = (λ - λs[i]) / (λs[i+1] - λs[i]); b = (φ - φs[j]) / (φs[j+1] - φs[j])
+            return (1 - a) * (1 - b) * M[i, j] + a * (1 - b) * M[i+1, j] +
+                   (1 - a) * b * M[i, j+1] + a * b * M[i+1, j+1]
+        end
+
+        λc = λnodes(cpu_parent_grid, Center(), Center(), Center())
+        φc = φnodes(cpu_parent_grid, Center(), Center(), Center())
+        zc_halo = znodes(cpu_parent_grid, Center(); with_halos = true)
+        zc_all = Float64[zc_halo[k] for k in firstindex(zc_halo):lastindex(zc_halo)]
+
+        p_host = similar(Tʰ)
+        Tᵛ = zeros(Ktot); p_col = zeros(Ktot)
+        k₀ = Hz + 1
+        anchors = Float64[]
+        for J in 1:Jtot, I in 1:Itot
+            i = clamp(I - Hx, 1, parent_Nx); j = clamp(J - Hy, 1, parent_Ny)
+            p₀ = msl_at(λc[i], φc[j]); push!(anchors, p₀)
+            ## Column Tᵛ with the exchanger's mixture gas constant; non-physical cells (unfilled
+            ## corners, below-ground garbage) take the nearest physical value above them.
+            for kk in 1:Ktot
+                k = clamp(kk, Hz + 1, Hz + Nk)
+                T = Tʰ[I, J, k]
+                Rᵐ = (1 - qᵛʰ[I, J, k] - qˡʰ[I, J, k] - qⁱʰ[I, J, k]) * Rᵈ + qᵛʰ[I, J, k] * Rᵛ
+                Tᵛ[kk] = (isfinite(T) && T > 100) ? T * Rᵐ / Rᵈ : NaN
+            end
+            for kk in Ktot-1:-1:1
+                isfinite(Tᵛ[kk]) || (Tᵛ[kk] = Tᵛ[kk+1])
+            end
+            for kk in 2:Ktot
+                isfinite(Tᵛ[kk]) || (Tᵛ[kk] = Tᵛ[kk-1])
+            end
+            p_col[k₀] = p₀ * exp(-g_std * zc_all[k₀] / (Rᵈ * Tᵛ[k₀]))
+            for kk in k₀+1:Ktot
+                p_col[kk] = p_col[kk-1] * exp(-g_std * (zc_all[kk] - zc_all[kk-1]) / (Rᵈ * (Tᵛ[kk-1] + Tᵛ[kk]) / 2))
+            end
+            for kk in k₀-1:-1:1
+                p_col[kk] = p_col[kk+1] * exp(+g_std * (zc_all[kk+1] - zc_all[kk]) / (Rᵈ * (Tᵛ[kk+1] + Tᵛ[kk]) / 2))
+            end
+            @views p_host[I, J, :] .= p_col
+        end
+        stage(@sprintf("parent pressure: AR_PARENT_PRESSURE=column — per-column hydrostatic from each column's Tᵛ, \
+                        anchored at ERA5 msl %s (anchor range %.0f–%.0f Pa); top-level p range %.0f–%.0f Pa",
+                       Dates.format(start_date, "yyyy-mm-ddTHH"), extrema(anchors)...,
+                       extrema(p_host[Hx+1:Hx+parent_Nx, Hy+1:Hy+parent_Ny, Hz+Nk])...))
+        copyto!(parent(parent_pressure), p_host)
+    end
 else
     stage("parent pressure: AR_PARENT_PRESSURE=isa — keeping the isothermal-288 K placeholder (hydrostatically \
            inconsistent with the parent temperature; expect the acoustic kick from the walls)")
@@ -1576,6 +1801,13 @@ stage(@sprintf("parent ready: %d×%d×%d PrescribedAtmosphere over [%.2f, %.2f]�
 # surface elevation to blend toward.
 
 relax_width = parse(Int, get(ENV, "AR_RELAX_WIDTH", "5"))
+## `AR_RELAX_TIMESCALE` (seconds, default 300) sets the Davies relaxation rate 1/τ at the frame.
+## `off` drops the interior relaxation forcing altogether (`relaxation_rate = nothing`) — not a physical
+## configuration: it exists to measure what the in-kernel Davies forcing costs (perf/PROFILE_REPORT.md).
+forcing_FT = ft_forcing ? eltype(grid) : Float64
+relax_rate = get(ENV, "AR_RELAX_TIMESCALE", "300") == "off" ? nothing :
+             forcing_FT(1 / parse(Float64, get(ENV, "AR_RELAX_TIMESCALE", "300")))
+lid_damping_rate = forcing_FT(1 / 5)   # nested_atmosphere_model's default, at the forcing float type
 aiva = get(ENV, "AR_AIVA", "0") == "1"
 
 # ### The traced clock
@@ -1622,7 +1854,268 @@ traced_clock() = VANILLA ?
 
 model_clock = traced_clock()
 
-microphysics = breeze_extension.default_nested_microphysics()
+# `AR_MICROPHYSICS=nonequilibrium` swaps the nest's default 1-moment SATURATION-ADJUSTMENT mixed-phase
+# scheme for the 1-moment NON-EQUILIBRIUM mixed-phase one (prognostic ρqᵛ, ρqᶜˡ, ρqᶜⁱ, ρqʳ, ρqˢⁿ). The
+# default has no snow source at all on Breeze main: `microphysical_tendency(::MP1M, Val(:ρqˢⁿ))` falls
+# through to zero (only the non-equilibrium variant defines ice → snow autoconversion, accretion,
+# deposition and melting), so cloud ice sits in ρqᵉ forever and only warm rain reaches the ground.
+# Breeze branch `ar/mixed-phase-positivity` (~/Breeze-micro; env ~/AtmosphericRivers-micro/env-micro) gives
+# the default scheme the same snow pathway and donor-limits every 1M process rate, which also makes the
+# non-equilibrium scheme stable at Δt = 10 s (it NaN'd within 20 min before): north-band 24 h precip
+# 6.9 → 12.1 mm, polygon 9.7 → 11.8 mm (figures/micro/). Without that Breeze this knob changes nothing
+# for snow under `equilibrium`.
+microphysics = if get(ENV, "AR_MICROPHYSICS", "equilibrium") == "nonequilibrium"
+    cm_extension = Base.get_extension(Breeze, :BreezeCloudMicrophysicsExt)
+    ## Any non-`nothing` ice entry is a phase indicator, materialized from the scheme's own parameters.
+    cm_extension.OneMomentCloudMicrophysics(FT; cloud_formation = Breeze.Microphysics.NonEquilibriumCloudFormation(nothing, :ice))
+else
+    breeze_extension.default_nested_microphysics()
+end
+stage("microphysics: $(summary(microphysics))")
+
+# ## Turbulence closure (`AR_CLOSURE`, default `tke`)
+#
+# Without one the nest has no subgrid vertical mixing at all: the surface fluxes from the ocean
+# coupling land in the lowest cell and stay there, and nothing mixes momentum, heat or moisture through
+# the boundary layer. `tke` is Breeze's `TKEBasedTurbulenceClosure` — a CATKE-like vertical
+# eddy diffusivity with prognostic ρe, vertically implicit diffusion and sinks — which adds the tracer
+# ρe to the child. ρe needs no lateral or Davies target (zero-gradient walls) and starts at a small
+# positive e₀ = AR_TKE_INITIAL (m² s⁻², default 1e-3; at zero the √e diffusivities never switch on).
+# `build_closure` is the single place the mixing length and stability functions are chosen.
+closure_kind = get(ENV, "AR_CLOSURE", "tke")
+closure_kind in ("tke", "none") || error("AR_CLOSURE must be tke or none, got $(closure_kind)")
+
+## `AR_TKE_FLAVOR` picks the closure's parameters:
+##   `main`    (default) `TKEMixingLength` + `ConstantStabilityFunctions`, Breeze main's API;
+##   `default` whatever this Breeze's constructor defaults to — on Breeze #975 that is
+##             `GradientLimitedMixingLength` + `ConstantStabilityFunctions` + `MoistStaticStability`;
+##   `catke`   Breeze #975's `catke_parameters()`: `GradientLimitedMixingLength(Cˢ = 1.131)` +
+##             `RiDependentStabilityFunctions` (CATKE's calibrated values).
+## #975 removes `TKEMixingLength`, so `main` only resolves on a Breeze without #975, and `catke` only
+## on one with it; the names are looked up when `build_closure` runs, not when the script parses.
+tke_flavor = get(ENV, "AR_TKE_FLAVOR", "main")
+tke_flavor in ("main", "default", "catke") || error("AR_TKE_FLAVOR must be main, default or catke, got $(tke_flavor)")
+
+function build_closure(FT)
+    td = Oceananigans.TurbulenceClosures.VerticallyImplicitTimeDiscretization()
+    tke_flavor == "default" && return TKEBasedTurbulenceClosure(td, FT)
+    tke_flavor == "catke" && return TKEBasedTurbulenceClosure(td, FT; Breeze.catke_parameters()...)
+    return TKEBasedTurbulenceClosure(td, FT; mixing_length = Breeze.TKEMixingLength(),
+                                             stability_functions = Breeze.ConstantStabilityFunctions())
+end
+
+closure = closure_kind == "tke" ? build_closure(FT) : nothing
+
+# ### Shim 15 (`AR_AD_SAFE_MICROPHYSICS`, default on under `AR_AD=1`): λ⁻¹ without 0/0 in reverse mode
+#
+# CloudMicrophysics' 1M `lambda_inverse` clamps q at 0 and takes `(ρ q r0^… / denom)^(1/(me+Δm+1))`,
+# which Julia evaluates as `exp(p · log x)`. Wherever q ≤ 0 — every rain/snow-free cell, and every
+# cell whose condensate went slightly negative — x = 0, the primal is fine (exp(−∞) = 0, then floored),
+# but the reverse pass computes ∂log/∂x = adjoint / x = 0/0 = NaN, which no strong-zero rule catches
+# (it is a division). Floor q and ρ at `ϵ_numerics` instead of 0: identical wherever q > ϵ (where the
+# callers' `ifelse(q > ϵ, rate, 0)` gates make the result matter), finite derivatives everywhere.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_MICROPHYSICS", "1") == "1"
+    @eval CloudMicrophysics.Microphysics1M @inline function lambda_inverse(
+            pdf::Union{CMP.ParticlePDFIceRain, CMP.ParticlePDFSnow}, mass::CMP.ParticleMass, q, ρ)
+        FT = UT.promote_typeof(q, ρ)
+        n0 = get_n0(pdf, q, ρ)
+        (; r0, m0, me, Δm, χm, gamma_coeff) = mass
+        qp = max(q, UT.ϵ_numerics(q))
+        ρp = max(ρ, UT.ϵ_numerics(ρ))
+        denom = χm * m0 * max(n0, UT.ϵ_numerics(n0)) * gamma_coeff
+        λ_inv = (ρp * qp * r0^(me + Δm) / denom)^(1 / (me + Δm + 1))
+        return max(r0 * FT(1e-5), λ_inv)
+    end
+    @info "shim 15: AD-safe CloudMicrophysics 1M lambda_inverse (q, ρ floored at ϵ_numerics)"
+end
+
+# ### Shim 16 (`AR_AD_SAFE_SECANT`, default on under `AR_AD=1`): a secant step with no 0/0 in reverse
+#
+# Saturation adjustment solves for T with Breeze's secant iteration, `Δx/Δr = (x₂ - x₁) / (r₂ - r₁)`,
+# guarded in the primal by `ifelse(isfinite(Δx/Δr), Δx/Δr, 0)` — once a cell converges, r₂ == r₁ and
+# x₂ == x₁, so the division is 0/0. The primal discards it; the reverse pass does not: the quotient
+# rule computes `-adjoint · Δx / Δr²` = 0/0 = NaN for every converged saturated cell, and the gradient
+# floods. That is why the adjoint goes all-NaN only after hours (more saturated, converged cells) with
+# a perfectly finite primal (jobs 2381, 2433, 2552: finite at 9 h, all-NaN at 12 h). Divide by a safe
+# denominator instead, selected BEFORE the division, so neither branch ever divides by zero.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_SECANT", "1") == "1"
+    @eval Breeze.Solvers begin
+        @inline function safe_secant_slope(x₁, x₂, r₁, r₂)
+            Δr = r₂ - r₁
+            degenerate = (Δr == 0) | !isfinite(Δr)
+            slope = (x₂ - x₁) / ifelse(degenerate, one(Δr), Δr)
+            return ifelse(degenerate | !isfinite(slope), zero(slope), slope), !degenerate
+        end
+        @inline function secant_solve(residual, solver::SecantSolver, x₁, x₂, scale)
+            r₁ = residual(x₁)
+            r₂ = residual(x₂)
+            iter = 0
+            while abs(r₂) > max(solver.abstol, solver.reltol * abs(scale)) && iter < solver.maxiter
+                ΔxΔr, valid_step = safe_secant_slope(x₁, x₂, r₁, r₂)
+                x₁, r₁ = x₂, r₂
+                x₂ -= r₂ * ΔxΔr
+                r₂ = residual(x₂)
+                r₂ = ifelse(valid_step, r₂, zero(r₂))
+                iter += 1
+            end
+            return x₂
+        end
+        @inline function secant_solve(residual, solver::FixedIterations, x₁, x₂, scale)
+            r₁ = residual(x₁)
+            r₂ = residual(x₂)
+            for _ in 1:solver.iterations
+                ΔxΔr, _ = safe_secant_slope(x₁, x₂, r₁, r₂)
+                x₁, r₁ = x₂, r₂
+                x₂ -= r₂ * ΔxΔr
+                r₂ = residual(x₂)
+            end
+            return x₂
+        end
+    end
+    @info "shim 16: AD-safe secant step in saturation adjustment (no 0/0 once converged)"
+end
+
+# ### Shim 17 (`AR_AD_FROZEN_K`, default on under `AR_AD=1` with TKE): frozen-diffusivity adjoint
+#
+# With the TKE closure the adjoint does not just pick up a stray NaN — it EXPLODES: production config, 3 h
+# window, median |∂J/∂ρqᵉ| = 7e10 and max 1e16 everywhere (job 2608), NaN by 6 h; without a closure the same
+# loss gives O(1–30) at 6 h. The tangent-linear of nonlinear vertical diffusion, ∂z(K(e, N², ℓ) ∂z c),
+# carries ∂z(K′ δe ∂z c), which is anti-diffusive wherever ∂K/∂e is large (K ∝ ℓ√e, and √e is floored
+# at e_min = 1e-6, so ∂K/∂e ~ 1/(2√e_min) = 500 where the TKE is quiet) — the well-known reason
+# operational 4D-Var adjoints use a simplified/"frozen-K" boundary-layer adjoint (Mahfouf 1999; Janisková
+# et al. 1999). So: the primal is unchanged, but the closure fields (diffusivities, mixing length, N², the
+# implicit TKE sink) are passed through `ignore_derivatives` after every computation. The gradient then
+# omits sensitivity THROUGH the turbulence coefficients — mixing still acts on the perturbations, with the
+# coefficients of the reference trajectory — which is the standard, documented approximation.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_FROZEN_K", "1") == "1" &&
+   isdefined(Breeze.TurbulenceClosures, :FlavorOfTKEClosure)
+    @eval function Oceananigans.TurbulenceClosures.compute_closure_fields!(closure_fields,
+                closure::Breeze.TurbulenceClosures.FlavorOfTKEClosure,
+                model::Breeze.AtmosphereModel{<:Any, <:Any, <:ReactantState}; parameters = :xyz)
+        invoke(Oceananigans.TurbulenceClosures.compute_closure_fields!,
+               Tuple{Any, Breeze.TurbulenceClosures.FlavorOfTKEClosure, Any},
+               closure_fields, closure, model; parameters)
+        for name in fieldnames(typeof(closure_fields))
+            f = getfield(closure_fields, name)
+            f isa Oceananigans.Fields.AbstractField || continue
+            data = parent(f)
+            data isa Reactant.TracedRArray && (data .= Reactant.Ops.ignore_derivatives(data))
+        end
+        return nothing
+    end
+    @info "shim 17: frozen-diffusivity adjoint (closure fields pass through ignore_derivatives)"
+end
+
+# ### Shim 18 (under `AR_AD_SAFE_MICROPHYSICS`): snow–rain accretion's √ without 0/0
+#
+# CloudMicrophysics' `accretion_snow_rain` forms Δv_eff = √((vᵢ − vⱼ)² + c(vᵢ² + vⱼ²)); both terminal
+# velocities are exactly 0 wherever either species is absent, so the radicand is 0 and the reverse pass
+# divides a zero adjoint by 2√0 = 0 → NaN, in every rain- or snow-free cell. Only the snow pathway
+# (env-micro's MP1M + snow) calls it, which is why that environment's adjoint went NaN within 3 h
+# (coastal_flux, no closure, job 2630) where Breeze main's stayed finite past 9 h. Floor the radicand.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_MICROPHYSICS", "1") == "1"
+    @eval CloudMicrophysics.Microphysics1M @inline function accretion_snow_rain(
+            type_i::CMP.PrecipitationType, type_j::CMP.PrecipitationType, blk1mveltype_ti, blk1mveltype_tj,
+            E_ij, coeff_disp, q_i, q_j, ρ, n0_i, n0_j, v0_i, v0_j, λ_i_inv, λ_j_inv)
+        (; r0, m0, me, Δm, χm, gamma_coeff) = type_j.mass
+        δ = me + Δm
+        v_ti = terminal_velocity(type_i, blk1mveltype_ti, ρ, q_i, v0_i, λ_i_inv)
+        v_tj = terminal_velocity(type_j, blk1mveltype_tj, ρ, q_j, v0_j, λ_j_inv)
+        radicand = (v_ti - v_tj)^2 + coeff_disp * (v_ti^2 + v_tj^2)
+        Δv_eff = sqrt(max(radicand, oftype(radicand, 1e-12)))
+        accr_rate =
+            π / ρ * n0_i * n0_j * m0 * χm * E_ij * Δv_eff * gamma_coeff /
+            r0^δ * (
+                2 * λ_i_inv^3 * λ_j_inv^(δ + 1) +
+                2 * (δ + 1) * λ_i_inv^2 * λ_j_inv^(δ + 2) +
+                (δ + 2) * (δ + 1) * λ_i_inv * λ_j_inv^(δ + 3)
+            )
+        ϵ = UT.ϵ_numerics(UT.promote_typeof(q_i, q_j))
+        cond = q_i > ϵ && q_j > ϵ
+        return ifelse(cond, accr_rate, zero(accr_rate))
+    end
+    @info "shim 18: AD-safe snow–rain accretion (√ radicand floored)"
+end
+
+# ### Shim 14 (`AR_AD_SAFE_TKE`, default on under `AR_AD=1`): no infinite derivatives in the TKE closure
+#
+# Breeze's TKE closure evaluates `√N²⁺` and `√|e|` where both can be exactly 0, and hides the result
+# behind an `ifelse` (ℓᴺ = Inf where N² ≤ 0; ω = 1/τ where e < 0). The primal is fine; the adjoint is
+# not — reverse mode propagates a zero adjoint into the unselected branch and multiplies it by the
+# infinite derivative of √ at 0, 0·∞ = NaN, which then floods every cell. (The TKE + column AD run 2410
+# gave a finite 1 h gradient and an all-NaN 6 h one.) Floor both radicands at a value far below
+# anything physical (N² ≥ 1e-12 s⁻², |e| ≥ 1e-10 m² s⁻²), which keeps every derivative finite and
+# changes no selected branch's value measurably.
+if closure_kind == "tke" && get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_TKE", "1") == "1" &&
+   isdefined(Breeze.TurbulenceClosures, :stratification_mixing_lengthᶜᶜᶠ) &&
+   isdefined(Breeze.TurbulenceClosures, :tke_sink_rate)
+    @eval Breeze.TurbulenceClosures begin
+        @inline function stratification_mixing_lengthᶜᶜᶠ(i, j, k, grid, closure, e, tracers, buoyancy)
+            FT = eltype(grid)
+            N²⁺ = clip(∂z_b(i, j, k, grid, buoyancy, tracers))
+            ℓᴺ = closure.mixing_length.Cᴺ * ℑzᵃᵃᶠ(i, j, k, grid, turbulent_velocityᶜᶜᶜ, closure, e) /
+                 sqrt(max(N²⁺, FT(1e-12)))
+            return ifelse(N²⁺ == 0, FT(Inf), ℓᴺ)
+        end
+        @inline function stratification_mixing_lengthᶜᶜᶜ(i, j, k, grid, closure, e, tracers, buoyancy)
+            FT = eltype(grid)
+            N²⁺ = clip(ℑbzᵃᵃᶜ(i, j, k, grid, ∂z_b, buoyancy, tracers))
+            ℓᴺ = closure.mixing_length.Cᴺ * turbulent_velocityᶜᶜᶜ(i, j, k, grid, closure, e) /
+                 sqrt(max(N²⁺, FT(1e-12)))
+            return ifelse(N²⁺ == 0, FT(Inf), ℓᴺ)
+        end
+        @inline function tke_sink_rate(i, j, k, grid, closure, e, B, velocities, tracers, buoyancy)
+            FT = eltype(grid)
+            eᵐⁱⁿ = closure.minimum_tke
+            eᵢ = @inbounds e[i, j, k]
+            ℓ = mixing_lengthᶜᶜᶜ(i, j, k, grid, closure, e, tracers, buoyancy)
+            Sᴰ = dissipation_stability_functionᶜᶜᶜ(i, j, k, grid, closure, velocities, tracers, buoyancy)
+            τ = closure.negative_tke_damping_time_scale
+            ω = ifelse(eᵢ < 0, 1 / τ, Sᴰ * sqrt(max(abs(eᵢ), FT(1e-10))) / ℓ)
+            B⁻ = min(0, B)
+            ωᴮ = -B⁻ / max(eᵢ, eᵐⁱⁿ) * (eᵢ > eᵐⁱⁿ)
+            return ω + ωᴮ
+        end
+    end
+    @info "shim 14: AD-safe TKE closure (√ radicands floored at N² ≥ 1e-12, |e| ≥ 1e-10)"
+end
+
+## The same hazards in Breeze #975's closure (env-975 / env-micro: GradientLimitedMixingLength, N² stored
+## in closure_fields), whose functions carry different names and signatures.
+if closure_kind == "tke" && get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_TKE", "1") == "1" &&
+   isdefined(Breeze.TurbulenceClosures, :buoyancy_penetration_depthᶜᶜᶠ)
+    @eval Breeze.TurbulenceClosures begin
+        @inline function buoyancy_penetration_depthᶜᶜᶠ(i, j, k, grid, closure, e, N²)
+            FT = eltype(grid)
+            N²⁺ = clip(@inbounds N²[i, j, k])
+            ℓᵇ = ℑzᵃᵃᶠ(i, j, k, grid, turbulent_velocityᶜᶜᶜ, closure, e) / sqrt(max(N²⁺, FT(1e-12)))
+            return ifelse(N²⁺ == 0, FT(Inf), ℓᵇ)
+        end
+        @inline function local_mixing_lengthᶜᶜᶜ(i, j, k, grid, closure, e, N²)
+            FT = eltype(grid)
+            d = closure.mixing_length.Cˢ * height_above_bottomᶜᶜᶜ(i, j, k, grid)
+            N²⁺ = clip(ℑbzᵃᵃᶜ(i, j, k, grid, face_valueᶜᶜᶠ, N²))
+            ℓᵇ = turbulent_velocityᶜᶜᶜ(i, j, k, grid, closure, e) / sqrt(max(N²⁺, FT(1e-12)))
+            ℓ = min(d, ifelse(N²⁺ == 0, FT(Inf), ℓᵇ))
+            return ifelse(isnan(ℓ), d, ℓ)
+        end
+        @inline function tke_sink_rate(i, j, k, grid, closure, e, B, velocities, closure_fields)
+            FT = eltype(grid)
+            eᵐⁱⁿ = closure.minimum_tke
+            eᵢ = @inbounds e[i, j, k]
+            ℓ = mixing_lengthᶜᶜᶜ(i, j, k, grid, closure, e, closure_fields)
+            Sᴰ = dissipation_stability_functionᶜᶜᶜ(i, j, k, grid, closure, velocities, closure_fields.N²)
+            τ = closure.negative_tke_damping_time_scale
+            ω = ifelse(eᵢ < 0, 1 / τ, Sᴰ * sqrt(max(abs(eᵢ), FT(1e-10))) / ℓ)
+            B⁻ = min(0, B)
+            ωᴮ = -B⁻ / max(eᵢ, eᵐⁱⁿ) * (eᵢ > eᵐⁱⁿ)
+            return ω + ωᴮ
+        end
+    end
+    @info "shim 14 (#975 closure): AD-safe buoyancy penetration depth, local mixing length, TKE sink"
+end
+initial_tke = parse(FT, get(ENV, "AR_TKE_INITIAL", "1e-3"))
+stage("turbulence closure: $(isnothing(closure) ? "none" : summary(closure))")
 explicit_scalar_advection = breeze_extension.default_nested_scalar_advection(microphysics)
 
 if aiva
@@ -1637,6 +2130,20 @@ else
     momentum_advection = WENO(order = 5)
     scalar_advection = explicit_scalar_advection
 end
+
+## The TKE tracer ρe is not in NumericalEarth's `default_nested_scalar_advection`, and a tracer missing
+## from a NamedTuple `tracer_advection` falls back to Oceananigans' default — second-order `Centered`,
+## unbounded (`validate_tracer_advection(::NamedTuple, grid) = Centered(), tuple`), which let e go
+## negative and overshoot. Give it the same bounds-preserving WENO(5) as the moisture, limited below
+## at 0 on the specific TKE e = ρe/ρ. The upper bound only has to be finite (an `Inf` would put
+## Inf/x terms into the limiter, and its derivative, for nothing): `AR_TKE_MAX`, m² s⁻², never binding.
+if closure_kind == "tke"
+    tke_max = parse(Float64, get(ENV, "AR_TKE_MAX", "1e4"))
+    tke_time_discretization = aiva ? (; time_discretization = implicit_vertical) : (;)
+    scalar_advection = merge(scalar_advection,
+                             (ρe = WENO(order = 5, bounds = (zero(tke_max), tke_max); tke_time_discretization...),))
+end
+stage("scalar advection: " * join(("$(name) => $(summary(scheme))" for (name, scheme) in pairs(scalar_advection)), ", "))
 
 # ### Shim 5: a host-decided acoustic substep count
 #
@@ -1661,13 +2168,39 @@ end
 
 Δt = parse(FT, get(ENV, "AR_DT", "10"))
 
+## ### Shim 13: AIVA's adaptive split step under a traced clock
+##
+## `AdaptiveVerticallyImplicitDiscretization` keeps its split time step in a host `Ref{FT}` and
+## refreshes it every stage from the clock (`update_adaptive_timestep!`): `td.Δt[] = β_stage · Δt`.
+## Under Reactant the clock's times are traced, so that store is `Float32(::TracedRNumber)` — a
+## `MethodError` while tracing the first step (job 2314). At a FIXED Δt the value is known on the host:
+## the stage index is a plain `Int` that the trace unrolls, so bake `stage_fraction(ts, stage) · Δt`
+## in per stage. `AIVA_HOST_DT[]` is set to the Δt about to be compiled (spin-up vs AD sweep); a
+## traced Δt schedule cannot use this and keeps the last value baked in.
+const AIVA_HOST_DT = Ref{Float64}(Δt)
+if !VANILLA
+    @eval function Oceananigans.Advection.update_adaptive_timestep!(
+            scheme::Oceananigans.Advection.AdaptiveImplicitVerticalAdvection,
+            model::Breeze.AtmosphereModel{<:Any, <:Any, <:ReactantState})
+        td = Oceananigans.TimeSteppers.time_discretization(scheme)
+        td.Δt[] = Breeze.TimeSteppers.stage_fraction(model.timestepper, model.clock.stage) * AIVA_HOST_DT[]
+        return nothing
+    end
+end
+
 acoustic_cfl = parse(FT, get(ENV, "AR_ACOUSTIC_CFL", "0.5"))
 thermodynamic_constants = Breeze.ThermodynamicConstants(FT)
 
 host_substeps = Breeze.CompressibleEquations.compute_acoustic_substeps(host_grid, Δt,
                                                                       thermodynamic_constants,
                                                                       acoustic_cfl)
-acoustic_substeps = parse(Int, get(ENV, "AR_ACOUSTIC_SUBSTEPS", string(host_substeps)))
+# `AR_ADAPTIVE=1` (eager CUDA only) floats Δt with an advective-CFL wizard — see the stepping section.
+# The substep count must then follow Δt, so it is left to Breeze (`substeps = nothing`), which
+# recomputes it from each stage's interval with the same formula. `AR_ACOUSTIC_SUBSTEPS` still wins.
+adaptive_Δt = get(ENV, "AR_ADAPTIVE", "0") == "1"
+adaptive_Δt && !VANILLA && error("AR_ADAPTIVE=1 requires AR_ARCH=cuda: a traced loop has a fixed Δt")
+acoustic_substeps = haskey(ENV, "AR_ACOUSTIC_SUBSTEPS") ? parse(Int, ENV["AR_ACOUSTIC_SUBSTEPS"]) :
+                    adaptive_Δt ? nothing : host_substeps
 
 ## Otherwise exactly `default_nested_dynamics(grid; …)`: an upper sponge over the lid, no divergence
 ## damping, and the script's `base_pressure`. Only `substeps` and `sponge` differ.
@@ -1682,13 +2215,36 @@ acoustic_substeps = parse(Int, get(ENV, "AR_ACOUSTIC_SUBSTEPS", string(host_subs
 ## propagating waves off the top. Fine for inspecting what a step emits, wrong for a science run.
 damping_depth = breeze_extension.default_lid_depth(host_grid)
 sponge = get(ENV, "AR_SPONGE", "1") == "1" ?
-    UpperSponge(damping_rate = 1/5, depth = damping_depth) : nothing
+    UpperSponge(damping_rate = lid_damping_rate, depth = damping_depth) : nothing
+
+## `AR_DIVERGENCE_DAMPING=α` (> 0) turns on Breeze's Klemp–Skamarock–Ha acoustic divergence damping
+## (`ThermalDivergenceDamping`, Breeze's own default at α = 0.1; explicit bound α ≤ 0.25) in place of
+## the NumericalEarth nest default `NoDivergenceDamping()`, which leaves only the off-centred vertical
+## solve to damp acoustic noise. A time-step-sweep knob: default 0 keeps the established behaviour.
+divergence_damping_coefficient = parse(FT, get(ENV, "AR_DIVERGENCE_DAMPING", "0"))
+## `AR_DIVERGENCE_DAMPING_VERTICAL=1` also folds the vertical part into the column tridiag
+## (`damp_vertical = true`).
+acoustic_damping = divergence_damping_coefficient > 0 ?
+    Breeze.CompressibleEquations.ThermalDivergenceDamping(; coefficient = divergence_damping_coefficient,
+                                                           damp_vertical = get(ENV, "AR_DIVERGENCE_DAMPING_VERTICAL", "0") == "1") :
+    NoDivergenceDamping()
+
+## `AR_FORWARD_WEIGHT=ω` sets the off-centring of the implicit vertical acoustic solve (Breeze default
+## 0.65; ω ∈ [0.5, 1], larger damps vertical acoustic modes more).
+acoustic_forward_weight = parse(FT, get(ENV, "AR_FORWARD_WEIGHT", "0.65"))
+
+## `AR_OPEN_BOUNDARY_RELAXATION=α` sets Breeze's per-substep relaxation of the outermost open-boundary
+## cell's ρ′, (ρθ)′ toward the prescribed wall value (Breeze default 0.5; must be in (0, 1], so ~0 is
+## "off"). It is applied every acoustic substep, so its total kick grows with the substep count.
+open_boundary_relaxation = parse(FT, get(ENV, "AR_OPEN_BOUNDARY_RELAXATION", "0.5"))
 
 nested_time_discretization = SplitExplicitTimeDiscretization(FT;
                                                              substeps = acoustic_substeps,
                                                              acoustic_cfl,
                                                              sponge,
-                                                             damping = NoDivergenceDamping())
+                                                             damping = acoustic_damping,
+                                                             forward_weight = acoustic_forward_weight,
+                                                             open_boundary_relaxation)
 
 ## Breeze 0.11 renamed the anchor `surface_pressure` → `base_pressure` (the reference pressure at
 ## z = 0; "surface pressure" now means the derived pressure at a column's ground). NumericalEarth
@@ -1702,59 +2258,134 @@ dynamics = CompressibleDynamics(nested_time_discretization; base_pressure = p_st
 ## construction, so paying a device round-trip per element is nothing; the point of the guard (do not
 ## silently iterate a large device array) is not in play. Scoped to this call so nothing else inherits
 ## the permission — and a scalar loop over an actual FIELD would show up as a stall, not a wrong answer.
-nest = if NATIVE_PARENT
-    VANILLA || error("AR_NATIVE_PARENT=1 requires AR_ARCH=cuda: the native constructor builds the \
-                      parent on `architecture(child_grid)`, and doing that on ReactantState is the \
-                      180 GB OOM (job 4749) this file's hand-rolled parent exists to avoid.")
-    stage("building the nest NATIVELY from the dataset (AR_NATIVE_PARENT=1) — ERA5 per-column \
-           geopotential heights, dataset-default padding, and the IC done by initialize_nested_child!")
-    ## Terrain: hand the blend an elevation FIELD, and give it the UNTAPERED orography.
-    ##
-    ## `materialize_nested_terrain!` takes "an elevation `Field`, or a topography dataset", so the
-    ## idealized range defined above can go through exactly the path `downscale.jl` uses for
-    ## `ETOPO2022()` — no ETOPO download needed (its scratchspace is empty on this cluster).
-    ##
-    ## Untapered on purpose. The `terrain_elevation` taper exists because the HAND-ROLLED parent is
-    ## flat and knows nothing about its own orography: `surface_elevation` returns `nothing` for a
-    ## plain `LatitudeLongitudeGrid`, so the child's ground had to be forced to zero at the walls by
-    ## hand. The native parent is a `PressureLevelGrid` and DOES know its surface elevation, so the
-    ## blend can match the child's ground to the orography the parent state was actually produced
-    ## with — which is the real requirement, and strictly better than flattening to zero.
-    ##
-    ## Getting this wrong is not cosmetic: job 6734 ran native-parent with `terrain = nothing`, so no
-    ## blend happened and the child kept ground tapered to zero underneath a parent with real
-    ## orography. The mismatch showed up as `ρv` reaching -418 (v ≈ -320 m/s), far worse than the
-    ## hand-rolled run's -94.
-    native_terrain = Field{Center, Center, Nothing}(grid)
-    set!(native_terrain, (λ, φ) -> orography(λ, φ))
+# The native parents (`AR_PARENT_KIND=native|boundary`) are built by `build_native_nest` for any child
+# grid: the device `grid` (GPU or ReactantState) and, under Reactant, the host twin `host_grid` too,
+# whose nest initializes the child (`initialize_nested_child!` cannot run on a Reactant grid; see the
+# CPU-twin IC below) and hands its state to the device. The terrain was already blended toward the
+# parent's surface elevation on `host_grid` above, so the nest gets `terrain = nothing`.
+#
+# The parent is built here rather than by `nested_atmosphere_model(grid, dataset; …)`, whose parent
+# type changed with NumericalEarth #750 (strips by default), so that `AR_PARENT_KIND` means the same
+# thing on either NumericalEarth.
+native_dates = start_date:Hour(1):(start_date + Hour(parent_hours))
+native_padding = parse(Float64, get(ENV, "AR_NATIVE_PADDING",
+                                    string(NumericalEarth.DataWrangling.default_horizontal_padding(dataset))))
 
-    nested_atmosphere_model(grid, dataset;
-                            dates = start_date:Hour(1):(start_date + Hour(2)),
-                            dir = era5_datadir,
-                            terrain = native_terrain,
-                            terrain_blend_length,
-                            terrain_smoothing_passes = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2")),
-                            relaxation_rate = 1/300,
-                            relaxation_width = relax_width,
-                            ## Passed explicitly so the anchor matches `dynamics` below, which was
-                            ## built with it — otherwise this method derives its own from the
-                            ## dataset's domain-mean surface pressure and the two disagree.
-                            base_pressure = p_std,
-                            clock = model_clock,
-                            dynamics,
-                            microphysics,
-                            momentum_advection,
-                            scalar_advection,
-                            balancer = get(ENV, "AR_BALANCER", "0") == "1")
+function crop_boundary_strip_files(child_grid)
+    ## Strip regions are new file names; cut them out of the cached padded child box
+    ## (`AR_STRIP_SOURCE_PADDING`, default 0.5° — the box `AR_PARENT_KIND=native` reads) instead of
+    ## queueing CDS requests. Same regions as `BoundaryPrescribedAtmosphere(grid, …)` builds.
+    box = BoundingBox(child_grid)
+    λw, λe = box.longitude
+    φs, φn = box.latitude
+    w = NumericalEarth.Atmospheres.relaxation_zone_width(child_grid, relax_width)
+    p = native_padding
+    λ = (λw - p, λe + p)
+    φ = (φs - p, φn + p)
+    regions = (BoundingBox(longitude = (λw - p, λw + w + p), latitude = φ),
+               BoundingBox(longitude = (λe - w - p, λe + p), latitude = φ),
+               BoundingBox(longitude = λ, latitude = (φs - p, φs + w + p)),
+               BoundingBox(longitude = λ, latitude = (φn - w - p, φn + p)))
+    source = BoundingBox(child_grid; padding = parse(Float64, get(ENV, "AR_STRIP_SOURCE_PADDING", "0.5")))
+    names = (:temperature, :eastward_velocity, :northward_velocity, :specific_humidity,
+             :specific_cloud_liquid_water_content, :specific_rain_water_content,
+             :specific_cloud_ice_water_content, :specific_snow_water_content, :geopotential)
+    sl = NumericalEarth.DataWrangling.matching_single_level_dataset(dataset)
+    made = crop_era5_regions!(regions, source, dataset, names,
+                              NumericalEarth.DataWrangling.expand_dates(dataset, :temperature, native_dates),
+                              era5_datadir; single_level = ((sl, :geopotential, start_date),))
+    stage("boundary strips: cropped $(made) ERA5 files from the cached $(source) box")
+    return nothing
+end
+
+if PARENT_KIND === :boundary
+    isdefined(NumericalEarth.Atmospheres, :BoundaryPrescribedAtmosphere) ||
+        error("AR_PARENT_KIND=boundary needs a NumericalEarth with BoundaryPrescribedAtmosphere (#750)")
+    include(joinpath(@__DIR__, "era5_crop.jl"))
+    crop_boundary_strip_files(host_grid)
+end
+
+# Returns `(nest, ic_prognostic_kw)`: the kwargs `initialize_nested_child!` needs for this nest's IC
+# (`prognostic` is a #750 keyword; a full parent's default is its own exchanger).
+function build_native_nest(child_grid, clock, dynamics)
+    arch = Oceananigans.Architectures.architecture(child_grid)
+    full_parent(dates) = PrescribedAtmosphere(BoundingBox(child_grid; padding = native_padding), dates, dataset;
+                                              architecture = arch, dir = era5_datadir)
+    native, snapshot = if PARENT_KIND === :boundary
+        strips = NumericalEarth.Atmospheres.BoundaryPrescribedAtmosphere(child_grid, native_dates, dataset;
+                                                                         width = relax_width, padding = native_padding,
+                                                                         dir = era5_datadir)
+        strips, full_parent(native_dates[1:2])
+    else
+        full = full_parent(native_dates)
+        full, full
+    end
+
+    kw = PARENT_KIND === :boundary ? (; parent_surface_elevation = NumericalEarth.surface_elevation(snapshot)) : (;)
+    nest = Reactant.@allowscalar nested_atmosphere_model(native, child_grid;
+                                                         terrain = nothing,
+                                                         relaxation_rate = relax_rate,
+                                                         relaxation_width = relax_width,
+                                                         ## The lid damping knob, where this script defines one.
+                                                         (@isdefined(lid_damping_rate) ? (; damping_rate = lid_damping_rate) : (;))...,
+                                                         ## Passed explicitly so the anchor matches `dynamics`.
+                                                         base_pressure = p_std,
+                                                         clock,
+                                                         dynamics,
+                                                         microphysics,
+                                                         closure,
+                                                         momentum_advection,
+                                                         scalar_advection,
+                                                         kw...)
+
+    ## The strips cannot supply an interior state: the IC comes from the full-domain snapshot through
+    ## an exchanger that matches the nest's own.
+    ic_kw = PARENT_KIND === :boundary ?
+        (; prognostic = breeze_extension.state_exchanger(snapshot, first(nest.exchanger)).prognostic) : (;)
+    return nest, ic_kw
+end
+
+nest = if NATIVE_PARENT
+    stage("building the nest with NumericalEarth's own ERA5 parent (AR_PARENT_KIND=$(PARENT_KIND)) — \
+           per-column geopotential levels, $(length(native_dates)) hourly dates, padding $(native_padding)°")
+    native_nest, native_ic_kw = build_native_nest(grid, model_clock, dynamics)
+    stage("$(PARENT_KIND) parent built: $(summary(native_nest.parent))")
+    native_balancer = get(ENV, "AR_BALANCER", "0") == "1"
+    if VANILLA
+        breeze_extension.initialize_nested_child!(native_nest, dataset, start_date, era5_datadir;
+                                                  balancer = native_balancer, native_ic_kw...)
+    else
+        ## Initialize a host twin of the same nest and copy its state to the device (as the hand-rolled
+        ## CPU-twin IC below does, minus its parent rebuild: here the twin builds its own native parent).
+        stage("native IC on a CPU twin (balancer $(native_balancer ? "on" : "off"))")
+        twin, twin_ic_kw = build_native_nest(host_grid, Clock(time = zero(FT)),
+                                             CompressibleDynamics(nested_time_discretization; base_pressure = p_std))
+        breeze_extension.initialize_nested_child!(twin, dataset, start_date, era5_datadir;
+                                                  balancer = native_balancer, twin_ic_kw...)
+        twin_prognostics = prognostic_fields(twin.child)
+        for (name, f) in pairs(prognostic_fields(native_nest.child))
+            copyto!(parent(f), Array(parent(twin_prognostics[name])))
+        end
+        if !isnothing(native_nest.child.dynamics.reference_state)
+            for fname in (:pressure, :density, :exner_function)
+                copyto!(parent(getfield(native_nest.child.dynamics.reference_state, fname)),
+                        Array(parent(getfield(twin.child.dynamics.reference_state, fname))))
+            end
+        end
+        stage("native IC: copied the twin's initialized state and reference to the device")
+    end
+    native_nest
 else
     Reactant.@allowscalar nested_atmosphere_model(parent_atmosphere, grid;
                                                      terrain = nothing,
-                                                     relaxation_rate = 1/300,
+                                                     relaxation_rate = relax_rate,
+                                                     damping_rate = lid_damping_rate,
                                                      relaxation_width = relax_width,
                                                      base_pressure = p_std,
                                                      clock = model_clock,
                                                      dynamics,
                                                      microphysics,
+                                                     closure,
                                                      momentum_advection,
                                                      scalar_advection)
 end
@@ -1837,7 +2468,8 @@ if get(ENV, "AR_TARGET_PROBE_ONLY", "0") == "1"
 end
 
 stage("nest built (exchanger window filled, open BCs + Davies forcing in place); " *
-      "$(acoustic_substeps) acoustic substeps per step (host-decided at CFL $(acoustic_cfl)); " *
+      (isnothing(acoustic_substeps) ? "acoustic substeps recomputed from each Δt at CFL $(acoustic_cfl); " :
+       "$(acoustic_substeps) acoustic substeps per step (host-decided at CFL $(acoustic_cfl)); ") *
       "upper sponge $(isnothing(sponge) ? "OFF" : "on")")
 
 # ## Initial condition
@@ -1973,8 +2605,14 @@ elseif ic_mode === :interpolated
             end
             f
         end
+        ## The twin's parent pressure is the DEVICE parent's, whatever `AR_PARENT_PRESSURE` built
+        ## (isa / hydrostatic / column) — it used to be the isothermal placeholder unconditionally, so the
+        ## IC was balanced against a different pressure than the boundaries and relaxation then imposed.
         cpu_pressure = CenterField(cpu_pgrid)
-        set!(cpu_pressure, (λ, φ, z) -> isa_pressure(z))
+        ## `AR_TWIN_ISA_PRESSURE=1` restores the old placeholder, to reproduce runs made before the fix.
+        get(ENV, "AR_TWIN_ISA_PRESSURE", "0") == "1" ?
+            set!(cpu_pressure, (λ, φ, z) -> isa_pressure(z)) :
+            copyto!(parent(cpu_pressure), Array(parent(parent_pressure)))
         cpu_parent = PrescribedAtmosphere(cpu_pgrid, parent_times;
                                           velocities = (u = cpu_fts(u_parent), v = cpu_fts(v_parent)),
                                           temperature = cpu_fts(T_parent),
@@ -1993,7 +2631,8 @@ elseif ic_mode === :interpolated
         twin_drag = parse(Float64, get(ENV, "AR_BOTTOM_DRAG", "0"))
         cpu_nest = nested_atmosphere_model(cpu_parent, host_grid;
                                            terrain = nothing,
-                                           relaxation_rate = 1/300,
+                                           relaxation_rate = relax_rate,
+                                           damping_rate = lid_damping_rate,
                                            relaxation_width = relax_width,
                                            base_pressure = p_std,
                                            clock = Clock(time = zero(FT)),
@@ -2003,6 +2642,7 @@ elseif ic_mode === :interpolated
                                            drag_surface_temperature = twin_drag > 0 ?
                                                parse(FT, get(ENV, "AR_DRAG_TSFC", "285")) : nothing,
                                            microphysics,
+                                           closure,
                                            momentum_advection,
                                            scalar_advection)
         breeze_extension.initialize_nested_child!(cpu_nest, nothing, nothing, nothing; balancer)
@@ -2083,6 +2723,15 @@ else
     end
 end
 
+## Seed the TKE: every IC path above leaves ρe at zero (the parent carries no turbulence), and at
+## e = 0 the closure's √e diffusivities and shear production stay zero forever.
+if haskey(prognostic_fields(child), :ρe)
+    ## Whole-parent host round trip: a broadcast over `interior` views of Reactant arrays scalar-indexes.
+    copyto!(parent(prognostic_fields(child).ρe), initial_tke .* Array(parent(prognostic_fields(child).ρᵈ)))
+    VANILLA && Oceananigans.TimeSteppers.update_state!(nest)
+    stage("TKE seeded: ρe = $(initial_tke) m² s⁻² × ρᵈ")
+end
+
 # ## Prescribed ocean surface (in place of the ERA5 SST snapshot)
 #
 # An analytic SST — warm in the southwest, cool in the northeast — with land cells (elevation above
@@ -2101,6 +2750,36 @@ ocean_grid = LatitudeLongitudeGrid(arch;
     h = terrain_elevation(λ, φ)
     ocean = open_ocean_temperature(λ, φ)
     return h > 1 ? ocean - 4 - 6.5e-3 * h : ocean
+end
+
+# `AR_SST=era5` replaces the analytic field with the cached ERA5 snapshot at `start_date` — `sst` over
+# open water, `skt` (skin temperature) over land and sea ice, as `downscale.jl` does — sampled at the
+# nearest 0.25° point to each child cell centre. Read from the corridor box cache (`AR_SST_REGION`).
+if get(ENV, "AR_SST", "analytic") == "era5"
+    const NCDatasets = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "NCDatasets")
+    sst_box = get(ENV, "AR_SST_REGION", "-170.5_-109.5_24.5_60.5")
+    era5_single(name, var) = NCDatasets.NCDataset(joinpath(era5_datadir,
+            "$(name)_ERA5HourlySingleLevel_$(Dates.format(start_date, "yyyy-mm-ddTHH"))_$(sst_box).nc")) do ds
+        x = ds[var]
+        values = ndims(x) == 3 ? x[:, :, 1] : x[:, :]
+        (Float64.(ds["longitude"][:]), Float64.(ds["latitude"][:]), Float64.(coalesce.(values, NaN)))
+    end
+    sst_λ, sst_φ, sst_values = era5_single("sea_surface_temperature", "sst")
+    _, _, skt_values = era5_single("skin_temperature", "skt")
+    λc = λnodes(host_grid, Center(), Center(), Center())
+    φc = φnodes(host_grid, Center(), Center(), Center())
+    const era5_surface_temperature = [begin
+                                          i = argmin(abs.(sst_λ .- λc[ic])); j = argmin(abs.(sst_φ .- φc[jc]))
+                                          isfinite(sst_values[i, j]) && terrain_elevation(λc[ic], φc[jc]) ≤ 1 ?
+                                              sst_values[i, j] : skt_values[i, j]
+                                      end for ic in 1:Nx, jc in 1:Ny]
+    @inline function surface_temperature(λ, φ)
+        i = clamp(round(Int, (λ - λ₁) / Δ + 0.5), 1, Nx)
+        j = clamp(round(Int, (φ - φ₁) / Δ + 0.5), 1, Ny)
+        return @inbounds era5_surface_temperature[i, j]
+    end
+    stage(@sprintf("AR_SST=era5: ERA5 sst/skt at %s, %.1f–%.1f K", start_date,
+                   extrema(era5_surface_temperature)...))
 end
 
 ocean = PrescribedOcean(ocean_grid)
@@ -2142,8 +2821,9 @@ set!(ocean.sea_surface_temperature[1], surface_temperature)
 # gradient sees the radiation pathway.
 radiation = if get(ENV, "AR_RADIATION", "0") == "1"
     radiation_every = parse(Int, get(ENV, "AR_RADIATION_EVERY", "1"))
-    stage("radiation: all-sky RRTMGP on IterationInterval($(radiation_every)) — NOT TimeInterval, \
-           which mutates host state and cannot be traced")
+    stage(VANILLA ? "radiation: all-sky RRTMGP on TimeInterval($(radiation_every) Δt) — once per interval" :
+                    "radiation: all-sky RRTMGP on IterationInterval($(radiation_every)) — NOT TimeInterval, \
+                     which mutates host state and cannot be traced")
     ## A bare nest must bind the surface temperature ITSELF. The RTM constructors accept
     ## `surface_temperature = nothing` so a coupled model can wire its interface SST in afterwards, and
     ## solving without one throws (`assert_bound_surface_temperature`, job 4846):
@@ -2181,17 +2861,37 @@ radiation = if get(ENV, "AR_RADIATION", "0") == "1"
     ##     shortwave path. A fixed zenith also means no diurnal cycle at all, which is harmless over a
     ##     20 s AD window and wrong over a multi-hour run — `DiurnalSolarPosition` is the traceable
     ##     option there (analytic, no calendar), if that becomes the configuration of interest.
+    ##
+    ## None of that applies under `AR_ARCH=cuda`, where nothing is traced: there `AR_SOLAR=apparent` (the
+    ## default on that path) uses Breeze's `ApparentSolarPosition` with `epoch = start_date`, i.e. the
+    ## real sun for each column and model time — the diurnal cycle a multi-hour hindcast needs.
+    ## `AR_SOLAR=fixed` keeps `FixedCosineZenith(AR_SOLAR_COS_ZENITH)` on either path.
+    solar_mode = get(ENV, "AR_SOLAR", VANILLA ? "apparent" : "fixed")
+    solar_mode == "apparent" && !VANILLA && error("AR_SOLAR=apparent consults the calendar and cannot be traced")
     cos_zenith = parse(Float64, get(ENV, "AR_SOLAR_COS_ZENITH", "0.35"))
-    stage(@sprintf("radiation solar position: FixedCosineZenith(%.3g) — no calendar, so traceable; \
-                    %s", cos_zenith,
-                   cos_zenith == 0 ? "longwave only (matches the case's pre-dawn start hour)" :
-                                     "exercises the shortwave solver (NOT the case's start hour, which is pre-dawn)"))
+    solar_position = solar_mode == "apparent" ? ApparentSolarPosition(epoch = start_date) :
+                                                FixedCosineZenith(cos_zenith)
+    solar_mode == "apparent" ?
+        stage("radiation solar position: ApparentSolarPosition(epoch = $(start_date)) — real diurnal cycle") :
+        stage(@sprintf("radiation solar position: FixedCosineZenith(%.3g) — no calendar, so traceable; \
+                        %s", cos_zenith,
+                       cos_zenith == 0 ? "longwave only (matches the case's pre-dawn start hour)" :
+                                         "exercises the shortwave solver (NOT the case's start hour, which is pre-dawn)"))
+
+    ## Eagerly, `IterationInterval` solves the radiation more than once per interval: `update_state!`
+    ## runs after every Runge–Kutta stage and asks the schedule each time, and the clock's iteration
+    ## only ticks at the end of the step, so `iteration % interval == 0` holds for the final update of
+    ## step n-1 AND the first two stages of step n — three RRTMGP solves per interval (job 2266:
+    ## ~0.5 s each on an A100, the run's largest single cost at Δt ≥ 30 s). `TimeInterval` counts its
+    ## actuations and fires once; its host-side bookkeeping is exactly what cannot be traced, so the
+    ## Reactant path keeps `IterationInterval`.
+    radiation_schedule = VANILLA ? TimeInterval(radiation_every * Δt) : IterationInterval(radiation_every)
 
     RadiativeTransferModel(grid, AllSkyOptics(), child.thermodynamic_constants;
-                           solar_position = FixedCosineZenith(cos_zenith),
+                           solar_position,
                            surface_albedo = 0.1,
                            surface_temperature = rad_surface_T,
-                           schedule = IterationInterval(radiation_every))
+                           schedule = radiation_schedule)
 else
     nothing
 end
@@ -2266,6 +2966,11 @@ atmosphere = Simulation(nest; Δt)
 # `eltype(::AbstractModel) = Float64` fallback applies, and the resulting `Float64` `Δt` reaches
 # `tick_stage!` on a `TracedRNumber{Float32}` clock as a mixed-width `stablehlo.add` that fails MLIR
 # verification. Assert rather than trust: the failure is 30 minutes of compiling away from here.
+## Oceananigans 0.113's `Simulation(::ReactantModel)` stores `Δt = Float64(Δt)` unconditionally. Only
+## the coupled path steps through `time_step!(sim, sim.Δt)`; the bare nest (and the AD path, which
+## calls `time_step!(model, Δt)` with the script's own `Δt`) never reads it, so the mismatch only
+## matters when coupling is requested.
+typeof(atmosphere.Δt) === typeof(Δt) || get(ENV, "AR_COUPLED", "1") != "1" ||
 @assert typeof(atmosphere.Δt) === typeof(Δt) "Simulation stored Δt as $(typeof(atmosphere.Δt)) but \
     the model steps at $(typeof(Δt)); eltype(nest) = $(eltype(nest)). A Float64 Δt against a Float32 \
     traced clock does not compile — check `Base.eltype(::NestedModel)` in NumericalEarth."
@@ -2389,6 +3094,7 @@ if VANILLA
     function step_for!(model, Δt, Nsteps)
         for _ = 1:Nsteps
             time_step!(model, Δt)
+            accumulate_precipitation!(Δt)
         end
         return nothing
     end
@@ -2452,12 +3158,12 @@ else
     (;)
 end
 
-ar_compile_options(; raise, raise_first = false, optimize = true, kwargs...) =
+ar_compile_options(; raise, raise_first = false, optimize = true, xla_debug_options = XLA_DEBUG_OPTIONS, kwargs...) =
     Reactant.CompileOptions(; optimization_passes = optimize,
                             raise, raise_first,
                             sync = true,
                             speculate_partial_ifs = true,
-                            xla_debug_options = XLA_DEBUG_OPTIONS,
+                            xla_debug_options,
                             kwargs...)
 
 ## `@code_hlo` defaults `shardy_passes`/`strip` to `:none` itself, but those defaults are dropped the
@@ -2576,6 +3282,20 @@ end
 breeze_child(nest::NestedModel) = nest.child
 breeze_child(coupled) = coupled.atmosphere.model.child
 
+# Surface precipitation accumulated every step (kg m⁻², i.e. mm of liquid water), from Breeze's
+# `bottom_precipitation_flux` — the bottom-face flux of every sedimenting condensate, so rain and
+# snow alike. CUDA path only: the snapshots carry the running total, and differencing two of them
+# gives the accumulation over any window. Under Reactant the traced loop is left untouched.
+if VANILLA
+    const precipitation_flux = Breeze.bottom_precipitation_flux(breeze_child(model))
+    const accumulated_precipitation = Field{Center, Center, Nothing}(breeze_child(model).grid)
+    function accumulate_precipitation!(Δt)
+        compute!(precipitation_flux)
+        parent(accumulated_precipitation) .+= Δt .* parent(precipitation_flux)
+        return nothing
+    end
+end
+
 function prognostic_bounds(model)
     fields = prognostic_fields(breeze_child(model))
     ## The non-finite COUNT is the load-bearing number, not the bounds. `minimum`/`maximum` lower to
@@ -2618,6 +3338,7 @@ host_number(x) = x isa Reactant.ConcreteRNumber ? Reactant.to_number(x) : x
 const JLD2 = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "JLD2")
 
 write_output = get(ENV, "AR_OUTPUT", "1") == "1"
+output_closure_fields = get(ENV, "AR_OUTPUT_CLOSURE", "0") == "1"
 output_path = get(ENV, "AR_OUTPUT_FILE",
                   "reactant_$(get(ENV, "AR_DOMAIN", "corridor"))_$(ic_mode)$(get(ENV, "AR_BALANCER", "0") == "1" ? "_balanced" : "").jld2")
 
@@ -2669,9 +3390,25 @@ function write_grid_metadata(path)
         file["meta/balancer"]          = get(ENV, "AR_BALANCER", "0") == "1"
         file["meta/reference_state_recomputed"] = get(ENV, "AR_REFERENCE_STATE", "0") == "1"
         file["meta/note"] = "Prognostic fields at their native staggered locations (see " *
-                            "<name>/location). Interiors only, halos excluded. The parent is the " *
-                            "script's ANALYTIC atmospheric river, not ERA5 data read from disk."
+                            "<name>/location). Interiors only, halos excluded. The parent is " *
+                            (get(ENV, "AR_PARENT", "analytic") == "era5" ?
+                             "ERA5 hourly pressure-level data read from disk." :
+                             "the script's ANALYTIC atmospheric river, not ERA5 data.")
+        file["meta/parent"]            = get(ENV, "AR_PARENT", "analytic")
+        file["meta/parent_kind"]       = string(PARENT_KIND)
+        file["meta/start_date"]        = string(start_date)
     end
+    return nothing
+end
+
+## Physical heights and cell volumes of the terrain-following child, evaluated with the grid's own
+## `znode`/`Vᶜᶜᶜ` on the host twin, so a reader never has to reimplement the terrain formulation.
+function write_physical_heights(file)
+    Nx, Ny, Nz = size(host_grid)
+    c, f = Center(), Face()
+    file["grid/z_physical_center"] = [Oceananigans.Grids.znode(i, j, k, host_grid, c, c, c) for i in 1:Nx, j in 1:Ny, k in 1:Nz]
+    file["grid/z_physical_face"]   = [Oceananigans.Grids.znode(i, j, k, host_grid, c, c, f) for i in 1:Nx, j in 1:Ny, k in 1:Nz+1]
+    file["grid/cell_volume"]       = [Oceananigans.Operators.Vᶜᶜᶜ(i, j, k, host_grid) for i in 1:Nx, j in 1:Ny, k in 1:Nz]
     return nothing
 end
 
@@ -2683,6 +3420,20 @@ function write_snapshot(path, model, iteration, t)
             file["timeseries/$name/$iteration"] = Array(host_interior(f))
             key = "location/$name"
             haskey(file, key) || (file[key] = location_name(f))
+        end
+        if VANILLA
+            file["timeseries/precipitation_flux/$iteration"] = Array(host_interior(precipitation_flux))[:, :, 1]
+            file["timeseries/accumulated_precipitation/$iteration"] =
+                Array(host_interior(accumulated_precipitation))[:, :, 1]
+        end
+        ## `AR_OUTPUT_CLOSURE=1`: the closure's diagnosed diffusivities (and, on Breeze #975, the
+        ## stored N² and mixing length), at (Center, Center, Face) — whatever `closure_fields` carries.
+        if output_closure_fields
+            cf = breeze_child(model).closure_fields
+            for name in (:Kᵘ, :Kᶜ, :ℓ, :N²)
+                hasproperty(cf, name) || continue
+                file["timeseries/closure_$(name)/$iteration"] = Array(host_interior(getproperty(cf, name)))
+            end
         end
         ## No separate iteration index: it would have to be deleted and rewritten on every
         ## snapshot, and a run killed mid-rewrite would leave the file inconsistent with its own
@@ -2791,6 +3542,7 @@ report(model, 0.0)
 
 if write_output
     write_grid_metadata(output_path)
+    JLD2.jldopen(write_physical_heights, output_path, "a+")
     write_snapshot(output_path, model, host_number(model.clock.iteration), host_number(model.clock.time))
     stage("writing snapshots to $(output_path)")
 end
@@ -2910,9 +3662,13 @@ if get(ENV, "AR_AD", "0") == "1"
     ## a FIXED checkpoint budget with recomputation scheduled to minimise the extra work around it.
     ## So memory is bounded by the budget no matter how long the window gets, and the cost of a longer
     ## window shows up as recomputation instead of as tape.
-    ad_step_list = [parse(Int, x) for x in split(get(ENV, "AR_AD_STEPS", "2"), ',') if !isempty(strip(x))]
+    ## Commas, colons or spaces: `sbatch --export` splits on commas, so batch submissions use colons.
+    ad_step_list = [parse(Int, x) for x in split(get(ENV, "AR_AD_STEPS", "2"), [',', ':', ' ']) if !isempty(strip(x))]
     smoke && (ad_step_list = [2])
     const AD_CHECKPOINT_BUDGET = parse(Int, get(ENV, "AR_AD_CHECKPOINTS", "4"))
+    ## `AR_AD_RAISE_FIRST=0` re-tests whether the raise-before-Enzyme ordering is still required
+    ## (REACTANT_AD_REPORT.md §4: it predates the union fix and may be a large share of the compile).
+    const AD_RAISE_FIRST = get(ENV, "AR_AD_RAISE_FIRST", "1") == "1"
 
     ## Compiled against this ARGUMENT's type, not its value — so a fresh `ConcreteRNumber` with a
     ## different step count reuses the same executable.
@@ -2933,6 +3689,114 @@ if get(ENV, "AR_AD", "0") == "1"
 
     control  = like(ad_prognostic)
     dcontrol = like(ad_prognostic)
+
+    ## ### `AR_AD_LOSS=precipitation`: accumulated surface precipitation over a region
+    ##
+    ## J = Σᵢⱼ wᵢⱼ Σₙ Δt Fᵢⱼ(tₙ) over the steps n > `AR_AD_ACCUM_START`, where F is Breeze's
+    ## `bottom_precipitation_flux` (kg m⁻² s⁻¹, positive down: the bottom-face flux of every
+    ## sedimenting condensate) evaluated after each `time_step!`. The weights w come from
+    ## `precipitation_weights(λ, φ, h)` in `AR_AD_LOSS_FILE` (default `sensitivity/loss.jl`), called once
+    ## on the host with the child's cell-centre longitudes, latitudes and terrain height; normalised
+    ## weights make J a region-mean accumulation in mm.
+    ##
+    ## Everything the loss needs beyond the model rides in `aux`, passed `Duplicated` so that the
+    ## accumulation buffer is a traced, mutable argument. A bonus of that: Enzyme's shadow of the
+    ## weights comes back as ∂J/∂w = the accumulated precipitation itself.
+    const AD_LOSS = get(ENV, "AR_AD_LOSS", "meansquare")
+    const PRECIPITATION_LOSS = AD_LOSS in ("precip", "precipitation")
+    const COASTAL_FLUX_LOSS = AD_LOSS == "coastal_flux"
+    PRECIPITATION_LOSS || COASTAL_FLUX_LOSS || AD_LOSS == "meansquare" ||
+        error("AR_AD_LOSS=$(AD_LOSS): use `meansquare`, `precipitation` or `coastal_flux`")
+
+    ## ### `AR_AD_LOSS=coastal_flux`: eastward moisture flux through a meridional plane off the coast
+    ##
+    ## J = time-mean, segment-mean vertically integrated eastward moisture flux (kg m⁻¹ s⁻¹, an IVT-like
+    ## number) through the u-face column nearest `AR_AD_PLANE_LON` (default −124.3°), over
+    ## `AR_AD_PLANE_LAT` (default 44.5–47.0°N), surface to model top:
+    ##
+    ##     J = (1 / N_acc) Σₙ Σⱼₖ Wⱼₖ ρuᵢ₀ⱼₖ ½(ρqᵉ/ρᵈ|ᵢ₀₋₁ + ρqᵉ/ρᵈ|ᵢ₀),   Wⱼₖ = A^x_{i₀jk} / Σⱼ Δy_{i₀j}
+    ##
+    ## with A^x the terrain-following face area (Δy·Δz). ρu is dry-density-weighted (ρᵈu) in Breeze, so
+    ## ρu·ρqᵉ/ρᵈ = u·ρqᵉ. Moisture is the PROGNOSTIC ρqᵉ — total non-precipitating water (vapour + cloud)
+    ## under the saturation-adjustment scheme — so the loss itself never differentiates through saturation
+    ## adjustment; the dynamics still does. Accumulated over steps n > AR_AD_ACCUM_START.
+    function coastal_plane_aux()
+        plane_λ = parse(Float64, get(ENV, "AR_AD_PLANE_LON", "-124.3"))
+        φ₁ᵖ, φ₂ᵖ = parse.(Float64, split(get(ENV, "AR_AD_PLANE_LAT", "44.5:47.0"), [',', ':']))
+        λf = Array(λnodes(host_grid, Face(), Center(), Center()))
+        φc = Array(φnodes(host_grid, Center(), Center(), Center()))
+        i₀ = argmin(abs.(λf .- plane_λ))
+        2 ≤ i₀ ≤ length(λf) - 1 || error("coastal_flux plane at $(plane_λ)° is on the domain wall")
+        band = findall(φ -> φ₁ᵖ ≤ φ ≤ φ₂ᵖ, φc)
+        Nxh, Nyh, Nzh = size(host_grid)
+        L = sum(Oceananigans.Operators.Δyᶠᶜᶜ(i₀, j, 1, host_grid) for j in band)
+        W = zeros(FT, Nyh, Nzh)
+        for j in band, k in 1:Nzh
+            W[j, k] = Oceananigans.Operators.Axᶠᶜᶜ(i₀, j, k, host_grid) / L
+        end
+        stage(@sprintf("AD: coastal_flux plane at u-face i₀ = %d (λ = %.3f°), %d rows %.2f–%.2f°N, segment %.0f km",
+                       i₀, λf[i₀], length(band), φc[first(band)], φc[last(band)], L / 1e3))
+        ## Host-only description of the plane, for the output file; kept out of the traced argument.
+        global COASTAL_PLANE_META = (λ = λf[i₀], i = i₀, φ_band = (φc[first(band)], φc[last(band)]),
+                                     rows = band, segment_m = L)
+        return (; plane_weights = Reactant.to_rarray(W),
+                  plane_acc = Reactant.to_rarray(zeros(FT, Nyh, Nzh)),
+                  start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))),
+                  plane_i = Val(i₀))
+    end
+
+    ad_aux = if COASTAL_FLUX_LOSS
+        coastal_plane_aux()
+    elseif PRECIPITATION_LOSS
+        loss_file = get(ENV, "AR_AD_LOSS_FILE", joinpath(@__DIR__, "sensitivity", "loss.jl"))
+        include(loss_file)
+        λc = Array(λnodes(host_grid, Center(), Center(), Center()))
+        φc = Array(φnodes(host_grid, Center(), Center(), Center()))
+        Hx, Hy, _ = Oceananigans.Grids.halo_size(host_grid)
+        Nxh, Nyh, _ = size(host_grid)
+        hc = Array(parent(host_grid.z.formulation.h))[Hx+1:Hx+Nxh, Hy+1:Hy+Nyh, 1]
+        ## Two accepted contracts: `precipitation_weights(λ, φ, h)` on cell centres, or
+        ## sensitivity/region.jl's `region_weights(λ_faces, φ_faces) -> (w, area)`.
+        w = if isdefined(@__MODULE__, :precipitation_weights)
+            Base.invokelatest(precipitation_weights, Float64.(λc), Float64.(φc), Float64.(hc))
+        else
+            λf = Array(λnodes(host_grid, Face(), Center(), Center()))
+            φf = Array(φnodes(host_grid, Center(), Face(), Center()))
+            first(Base.invokelatest(region_weights, Float64.(λf), Float64.(φf)))
+        end
+        size(w) == (Nxh, Nyh) || error("precipitation_weights returned $(size(w)), expected $((Nxh, Nyh))")
+        all(isfinite, w) || error("precipitation_weights returned non-finite weights")
+
+        weights_field = Field{Center, Center, Nothing}(grid)
+        host_weights = zeros(FT, size(parent(weights_field)))
+        view(host_weights, parentindices(interior(weights_field))...) .= reshape(FT.(w), Nxh, Nyh, 1)
+        copyto!(parent(weights_field), host_weights)
+
+        stage(@sprintf("AD: precipitation loss from %s — %d columns weighted, Σw = %.4g",
+                       loss_file, count(!iszero, w), sum(w)))
+        base_aux = (; accumulated = Field{Center, Center, Nothing}(grid),
+                      weights = weights_field,
+                      start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))))
+
+        ## `AR_AD_DT_SCHEDULE=<file>`: replay a recorded adaptive-Δt schedule (one Δt in seconds per
+        ## line, step n of the AD window uses line n) instead of the fixed `AR_DT`. The schedule rides
+        ## in as a device array indexed by the traced step counter, so `time_step!` receives a TRACED
+        ## Δt. The acoustic substep count is still host-decided from `AR_DT` (shim 5), so set `AR_DT`
+        ## to the schedule's maximum. Windows longer than the schedule reuse its last entry.
+        schedule_file = get(ENV, "AR_AD_DT_SCHEDULE", "")
+        if isempty(schedule_file)
+            base_aux
+        else
+            dts = [parse(FT, l) for l in eachline(schedule_file) if !isempty(strip(l))]
+            maximum(dts) <= Δt || @warn "AR_AD_DT_SCHEDULE: max Δt $(maximum(dts)) s exceeds AR_DT = $(Δt) s, \
+                                         which sized the acoustic substeps"
+            stage(@sprintf("AD: replaying %d recorded Δt from %s (%.1f–%.1f s, mean %.1f s)",
+                           length(dts), schedule_file, minimum(dts), maximum(dts), sum(dts) / length(dts)))
+            merge(base_aux, (; dts = Reactant.to_rarray(dts)))
+        end
+    else
+        nothing
+    end
 
     ## ### The opening step runs OUTSIDE the differentiated region
     ##
@@ -2956,14 +3820,43 @@ if get(ENV, "AR_AD", "0") == "1"
     ##
     ## `AR_AD_FIRST_STEP=0` skips it, which is how job 4785's NaN was diagnosed — keep it for triage,
     ## not for results.
+    ## ### `AR_AD_SPINUP_STEPS`: settle the cold start at a small Δt before the long-Δt adjoint
+    ##
+    ## The interpolated ERA5 IC is unbalanced, and the opening step's ρw kick grows with Δt (−4.8,
+    ## −20.7, −38 for 10/30/40 s at 12 km): long steps blow up at the FIRST step, not in the steady
+    ## flow. So run `first_time_step!` and `AR_AD_SPINUP_STEPS` further steps at `AR_AD_SPINUP_DT`
+    ## (default 10 s), compiled forward-only and NOT differentiated, then differentiate at `AR_DT`.
+    ## The acoustic substep count stays the one shim 5 sized for `AR_DT`, i.e. MORE substeps than the
+    ## short spin-up steps need, which only costs time. The control then perturbs the state at
+    ## t = Δt_spin · (1 + AR_AD_SPINUP_STEPS), and the AD window must fit in what is left of
+    ## AR_PARENT_HOURS after it.
+    ad_spinup_steps = parse(Int, get(ENV, "AR_AD_SPINUP_STEPS", "0"))
+    Δt_first = ad_spinup_steps > 0 ? parse(FT, get(ENV, "AR_AD_SPINUP_DT", "10")) : Δt
+
     if get(ENV, "AR_AD_FIRST_STEP", "1") == "1"
-        stage("AD: compiling first_time_step! (outside the differentiated region)")
+        AIVA_HOST_DT[] = Δt_first
+        stage("AD: compiling first_time_step! at Δt = $(Δt_first) s (outside the differentiated region)")
         compile_start = time_ns()
         r_ad_first = @compile compile_options = ar_compile_options(raise = raise_option) first_time_step!(
-            model, Δt)
+            model, Δt_first)
         stage(@sprintf("AD: compiled first_time_step! in %.1f s", 1e-9 * (time_ns() - compile_start)))
-        r_ad_first(model, Δt)
+        r_ad_first(model, Δt_first)
         stage("AD: ran first_time_step!; the differentiated segment starts from the state it left")
+        report(model, 0.0)
+    end
+
+    if ad_spinup_steps > 0
+        AIVA_HOST_DT[] = Δt_first
+        stage("AD: compiling the spin-up loop ($(ad_spinup_steps) steps at Δt = $(Δt_first) s, forward only)")
+        compile_start = time_ns()
+        spinup_n = Reactant.ConcreteRNumber(ad_spinup_steps)
+        r_spinup = @compile compile_options = ar_compile_options(raise = raise_option) step_for!(
+            model, Δt_first, spinup_n)
+        stage(@sprintf("AD: compiled the spin-up loop in %.1f s", 1e-9 * (time_ns() - compile_start)))
+        spin_start = time_ns()
+        r_spinup(model, Δt_first, spinup_n)
+        stage(@sprintf("AD: spun up %d steps in %.1f s; t = %.0f s", ad_spinup_steps,
+                       1e-9 * (time_ns() - spin_start), host_number(breeze_child(model).clock.time)))
         report(model, 0.0)
     end
 
@@ -2971,6 +3864,50 @@ if get(ENV, "AR_AD", "0") == "1"
     ## trajectory exactly. Host round trip rather than a device-to-device broadcast: `Array(parent(·))`
     ## then a host→device `copyto!` is the direction Reactant specializes (shim 6's note).
     copyto!(parent(control), Array(parent(ad_prognostic)))
+
+    ad_checkpointing() = AD_CHECKPOINT_BUDGET < 0 ? true :
+                         AD_CHECKPOINT_BUDGET == 0 ? false :
+                         Reactant.Binomial(AD_CHECKPOINT_BUDGET)
+
+    scheduled_Δt(aux, n, Δt) = haskey(aux, :dts) ? aux.dts[min(n, length(aux.dts))] : Δt
+
+    @inline function plane_flux(child, ::Val{i₀}) where i₀
+        fields = prognostic_fields(child)
+        ρu = view(interior(fields.ρu), i₀, :, :)
+        q₋ = view(interior(fields[AD_CONTROL]), i₀ - 1, :, :) ./ view(interior(fields.ρᵈ), i₀ - 1, :, :)
+        q₊ = view(interior(fields[AD_CONTROL]), i₀, :, :) ./ view(interior(fields.ρᵈ), i₀, :, :)
+        return ρu .* (q₋ .+ q₊) ./ 2
+    end
+
+    function ad_loss(model, control, aux::NamedTuple{K}, Δt, nsteps) where K
+        :plane_weights in K || return precipitation_loss(model, control, aux, Δt, nsteps)
+        child = breeze_child(model)
+        interior(prognostic_fields(child)[AD_CONTROL]) .= interior(control)
+        acc = aux.plane_acc
+        acc .= 0
+        @trace mincut = true checkpointing = ad_checkpointing() track_numbers = false for n = 1:nsteps
+            time_step!(model, Δt)
+            acc .+= ifelse(n > aux.start, one(Δt), zero(Δt)) .* plane_flux(child, aux.plane_i)
+        end
+        return sum(aux.plane_weights .* acc) / (nsteps - aux.start)
+    end
+
+    function precipitation_loss(model, control, aux::NamedTuple, Δt, nsteps)
+        child = breeze_child(model)
+        interior(prognostic_fields(child)[AD_CONTROL]) .= interior(control)
+        acc = interior(aux.accumulated)
+        acc .= 0
+        @trace mincut = true checkpointing = ad_checkpointing() track_numbers = false for n = 1:nsteps
+            Δtₙ = scheduled_Δt(aux, n, Δt)
+            time_step!(model, Δtₙ)
+            flux = Breeze.AtmosphereModels.bottom_precipitation_flux(child)
+            compute!(flux)
+            acc .+= ifelse(n > aux.start, Δtₙ, zero(Δtₙ)) .* interior(flux)
+        end
+        return sum(interior(aux.weights) .* acc)
+    end
+
+    ad_loss(model, control, ::Nothing, Δt, nsteps) = ad_loss(model, control, Δt, nsteps)
 
     function ad_loss(model, control, Δt, nsteps)
         interior(prognostic_fields(breeze_child(model))[AD_CONTROL]) .= interior(control)
@@ -2987,7 +3924,7 @@ if get(ENV, "AR_AD", "0") == "1"
         return sum(x .^ 2) / length(x)
     end
 
-    function ad_gradient!(model, dmodel, control, dcontrol, Δt, nsteps)
+    function ad_gradient!(model, dmodel, control, dcontrol, aux, daux, Δt, nsteps)
         ## Enzyme ACCUMULATES into the shadow, so a second call would return the sum of both sweeps.
         parent(dcontrol) .= 0
         _, loss_value = Enzyme.autodiff(
@@ -2997,12 +3934,13 @@ if get(ENV, "AR_AD", "0") == "1"
             ad_loss, Enzyme.Active,
             Enzyme.Duplicated(model, dmodel),
             Enzyme.Duplicated(control, dcontrol),
+            isnothing(aux) ? Enzyme.Const(aux) : Enzyme.Duplicated(aux, daux),
             Enzyme.Const(Δt),
             Enzyme.Const(nsteps))
         return dcontrol, loss_value
     end
 
-    stage("AD: ∂/∂$(AD_CONTROL) of mean($(AD_TARGET)²); windows $(join(ad_step_list, ", ")) steps, " *
+    stage("AD: ∂/∂$(AD_CONTROL) of $(PRECIPITATION_LOSS ? "weighted accumulated precipitation" : "mean($(AD_TARGET)²)"); windows $(join(ad_step_list, ", ")) steps, " *
           "$(AD_CHECKPOINT_BUDGET < 0 ? "automatic (true)" : AD_CHECKPOINT_BUDGET == 0 ? "no" : "Binomial($(AD_CHECKPOINT_BUDGET))") " *
           "checkpointing, $(ad_traced_steps ? "traced" : "static") trip count")
 
@@ -3013,6 +3951,7 @@ if get(ENV, "AR_AD", "0") == "1"
     shadow_start = time_ns()
     dmodel = Enzyme.make_zero(model)
     stage(@sprintf("AD: built the model shadow in %.1f s", 1e-9 * (time_ns() - shadow_start)))
+    ad_daux = isnothing(ad_aux) ? nothing : Enzyme.make_zero(ad_aux)
 
     ## Calling the compiled thunk overflows the default 8 MB task stack (job 4784: the sweep
     ## COMPILED in 3805.8 s, then died in `Reactant.Compiler.Thunk`). `(::Thunk)(args...)` is a
@@ -3094,10 +4033,11 @@ if get(ENV, "AR_AD", "0") == "1"
     ## no `first_time_step!`, so it enters RK3 straight from an unbalanced initial condition); finite
     ## here with NaN from the sweep means the augmented forward is.
     if get(ENV, "AR_AD_PRIMAL_ONLY", "0") == "1"
+        AIVA_HOST_DT[] = Δt
         stage("AD: AR_AD_PRIMAL_ONLY=1 — compiling the LOSS only (no Enzyme)")
         compile_start = time_ns()
         r_ad_loss = @compile compile_options = ar_compile_options(
-            raise = raise_option, raise_first = true) ad_loss(model, control, Δt, ad_steps)
+            raise = raise_option, raise_first = AD_RAISE_FIRST) ad_loss(model, control, ad_aux, Δt, ad_steps)
         stage(@sprintf("AD: compiled the loss in %.1f s", 1e-9 * (time_ns() - compile_start)))
 
         ## `AR_AD_FD_DIR=<gradient.jld2>` turns this into a FINITE-DIFFERENCE check of a gradient a
@@ -3117,7 +4057,7 @@ if get(ENV, "AR_AD", "0") == "1"
         ## plateaus at that factor instead. The loss executable is already compiled, so each extra ε
         ## costs one evaluation, not one compile.
         fd_dir = get(ENV, "AR_AD_FD_DIR", "")
-        fd_eps_list = [parse(Float64, x) for x in split(get(ENV, "AR_AD_FD_EPS", "1e-3"), ',')
+        fd_eps_list = [parse(Float64, x) for x in split(get(ENV, "AR_AD_FD_EPS", "1e-3"), [',', ':'])
                        if !isempty(strip(x))]
 
         ## The control's own bytes, saved BEFORE anything is evaluated. Reading the perturbation base
@@ -3132,7 +4072,7 @@ if get(ENV, "AR_AD", "0") == "1"
         restore_ad_state!()
         eval_start = time_ns()
         J_only = with_big_stack() do
-            r_ad_loss(model, control, Δt, ad_steps)
+            r_ad_loss(model, control, ad_aux, Δt, ad_steps)
         end
 
         if !isempty(fd_dir)
@@ -3153,7 +4093,7 @@ if get(ENV, "AR_AD", "0") == "1"
 
                 restore_ad_state!()
                 J_pert = with_big_stack() do
-                    r_ad_loss(model, control, Δt, ad_steps)
+                    r_ad_loss(model, control, ad_aux, Δt, ad_steps)
                 end
 
                 fd = (host_number(J_pert) - host_number(J_only)) / fd_eps
@@ -3219,8 +4159,8 @@ if get(ENV, "AR_AD", "0") == "1"
               "($(ad_traced_steps ? "TRACED" : "static") trip count, Binomial($(AD_CHECKPOINT_BUDGET)))")
         trace_start = time_ns()
         ad_module = @code_hlo compile_options = ar_hlo_options(
-            raise = raise_option, raise_first = true) ad_gradient!(
-            model, dmodel, control, dcontrol, Δt, ad_steps)
+            raise = raise_option, raise_first = AD_RAISE_FIRST) ad_gradient!(
+            model, dmodel, control, dcontrol, ad_aux, ad_daux, Δt, ad_steps)
         stage(@sprintf("AD: traced in %.1f s", 1e-9 * (time_ns() - trace_start)))
 
         write(hlo_path, repr(ad_module))
@@ -3229,11 +4169,18 @@ if get(ENV, "AR_AD", "0") == "1"
         exit(0)
     end
 
-    stage("AD: compiling the reverse sweep (raise_first = true) — ONE compile for every window")
+    AIVA_HOST_DT[] = Δt
+    stage("AD: compiling the reverse sweep (raise_first = $(AD_RAISE_FIRST)) — ONE compile for every window")
     compile_start = time_ns()
+    ## `AR_AD_DETECT_NAN=1`: XLA checks every thunk of the REVERSE executable for NaN and logs the
+    ## offending HLO instruction (warning mode). Only this compile — the same pass breaks the eager
+    ## kernel compiles ("Module output slices must not contain tuple shapes", job 2611).
+    ad_debug_options = get(ENV, "AR_AD_DETECT_NAN", "0") == "1" ?
+        merge(XLA_DEBUG_OPTIONS, (; xla_gpu_detect_nan = Reactant.Proto.xla.var"DebugOptions.DetectionMode".DETECTION_MODE_WARNING)) :
+        XLA_DEBUG_OPTIONS
     r_ad_gradient! = @compile compile_options = ar_compile_options(
-        raise = raise_option, raise_first = true) ad_gradient!(
-        model, dmodel, control, dcontrol, Δt, ad_steps)
+        raise = raise_option, raise_first = AD_RAISE_FIRST, xla_debug_options = ad_debug_options) ad_gradient!(
+        model, dmodel, control, dcontrol, ad_aux, ad_daux, Δt, ad_steps)
     ad_compile_seconds = 1e-9 * (time_ns() - compile_start)
     stage(@sprintf("AD: compiled the reverse sweep in %.1f s", ad_compile_seconds))
 
@@ -3245,6 +4192,7 @@ if get(ENV, "AR_AD", "0") == "1"
         ## `dmodel` above exists only to give `@compile` an argument to specialize on, and must not
         ## be carried from one window into the next.
         local dmodel = Enzyme.make_zero(model)
+        local ad_daux = isnothing(ad_aux) ? nothing : Enzyme.make_zero(ad_aux)
         restore_ad_state!()
 
         ## Same executable, new value — this is the point of tracing the trip count.
@@ -3252,7 +4200,7 @@ if get(ENV, "AR_AD", "0") == "1"
 
         sweep_start = time_ns()
         ∂J, J = with_big_stack() do
-            r_ad_gradient!(model, dmodel, control, dcontrol, Δt, nsteps_r)
+            r_ad_gradient!(model, dmodel, control, dcontrol, ad_aux, ad_daux, Δt, nsteps_r)
         end
         sweep_seconds = 1e-9 * (time_ns() - sweep_start)
 
@@ -3286,8 +4234,14 @@ if get(ENV, "AR_AD", "0") == "1"
         end
 
         if write_output
-            ad_path = get(ENV, "AR_AD_FILE",
-                          "reactant_$(get(ENV, "AR_DOMAIN", "corridor"))_gradient_$(AD_CONTROL)_$(AD_TARGET)_$(n)steps.jld2")
+            ad_default = PRECIPITATION_LOSS ?
+                "reactant_$(get(ENV, "AR_DOMAIN", "corridor"))_sensitivity_precip_$(AD_CONTROL)_$(n)steps.jld2" :
+                "reactant_$(get(ENV, "AR_DOMAIN", "corridor"))_gradient_$(AD_CONTROL)_$(AD_TARGET)_$(n)steps.jld2"
+            ad_file = get(ENV, "AR_AD_FILE", "")
+            ## A single AR_AD_FILE with several windows would be overwritten window by window, so
+            ## suffix the step count whenever more than one window runs.
+            ad_path = isempty(ad_file) ? ad_default :
+                      length(ad_step_list) > 1 ? replace(ad_file, r"\.jld2$" => "_$(n)steps.jld2") : ad_file
             write_grid_metadata(ad_path)
             JLD2.jldopen(ad_path, "a+") do file
                 file["ad/gradient"]        = g
@@ -3300,6 +4254,32 @@ if get(ENV, "AR_AD", "0") == "1"
                 file["ad/control_initial"] = Array(host_interior(control))
                 file["ad/sweep_seconds"]   = sweep_seconds
                 file["ad/compile_seconds"] = ad_compile_seconds
+                file["ad/loss_kind"]       = AD_LOSS
+                file["ad/terrain_source"]  = get(ENV, "AR_TERRAIN", "etopo")
+                file["ad/terrain_smoothing_passes"] = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2"))
+                file["ad/spinup_steps"]    = ad_spinup_steps
+                file["ad/spinup_dt"]       = Float64(Δt_first)
+                file["ad/control_time"]    = Float64(host_number(ad_clock0[1][:time]))
+                file["ad/dt"]              = Float64(Δt)
+                file["ad/control_value"]   = Array(host_interior(control))
+                write_physical_heights(file)
+                if COASTAL_FLUX_LOSS
+                    m = COASTAL_PLANE_META
+                    file["ad/plane_lambda"]   = m.λ
+                    file["ad/plane_i"]        = m.i
+                    file["ad/plane_phi_band"] = collect(m.φ_band)
+                    file["ad/plane_rows"]     = collect(m.rows)
+                    file["ad/plane_segment_m"] = m.segment_m
+                    file["ad/plane_weights"]  = Array(ad_aux.plane_weights)
+                    file["ad/accum_start"]    = host_number(ad_aux.start)
+                    file["ad/loss_units"]     = "kg m^-1 s^-1: time-mean, segment-mean ∫ u ρqᵉ dz through the plane (ρqᵉ = vapour + cloud)"
+                end
+                if PRECIPITATION_LOSS
+                    file["ad/weights"]              = Array(host_interior(ad_aux.weights))[:, :, 1]
+                    file["ad/precip_accumulated"]   = Array(host_interior(ad_aux.accumulated))[:, :, 1]
+                    file["ad/accum_start"]          = host_number(ad_aux.start)
+                    file["ad/loss_units"]           = "kg m^-2 (mm), weighted by ad/weights"
+                end
                 file["ad/note"] = "∂J/∂control at every interior cell, where J = mean(interior(" *
                                   string(AD_TARGET) * ")²) after $(n) time_step!s. The opening " *
                                   "first_time_step! ran OUTSIDE the differentiated region, so this " *
@@ -3364,21 +4344,178 @@ end
 
 worst_nonfinite = 0
 
+# `AR_BOUNDARY_PROBE=<file.jld2>` (eager CUDA only): write the child's state WITH halos — prognostics,
+# total density, diagnosed pressure, and every field of the reference state — before and after one
+# `first_time_step!`, plus physical heights, then exit. The halos carry the open-boundary values, so
+# the file shows the jump between the prescribed wall state and the first interior cells, and
+# (after − before)/Δt is the step-1 tendency at the frame.
+if haskey(ENV, "AR_BOUNDARY_PROBE")
+    VANILLA || error("AR_BOUNDARY_PROBE requires AR_ARCH=cuda")
+    probe_path = ENV["AR_BOUNDARY_PROBE"]
+    probe_child = breeze_child(model)
+    probe_fields() = merge(prognostic_fields(probe_child),
+                           (; ρ = probe_child.dynamics.total_density, p = probe_child.dynamics.pressure))
+    JLD2.jldopen(probe_path, "w") do file
+        file["dt"] = Float64(Δt)
+        file["halo"] = collect(Oceananigans.Grids.halo_size(host_grid))
+        file["size"] = collect(size(host_grid))
+        file["grid/lambda_center"] = Array(λnodes(host_grid, Center(), Center(), Center()))
+        file["grid/phi_center"] = Array(φnodes(host_grid, Center(), Center(), Center()))
+        write_physical_heights(file)
+        for (name, f) in pairs(probe_fields())
+            file["before/$name"] = Array(parent(f))
+        end
+        reference = probe_child.dynamics.reference_state
+        for name in propertynames(reference)
+            f = getproperty(reference, name)
+            f isa Oceananigans.Fields.AbstractField && (file["reference/$name"] = Array(parent(f)))
+        end
+    end
+    first_time_step!(model, Δt)
+    JLD2.jldopen(probe_path, "a+") do file
+        for (name, f) in pairs(probe_fields())
+            file["after/$name"] = Array(parent(f))
+        end
+    end
+    stage("AR_BOUNDARY_PROBE: wrote the before/after state with halos to $(probe_path)")
+    exit(0)
+end
+
 snapshot!(model) = write_output &&
     write_snapshot(output_path, model, host_number(model.clock.iteration), host_number(model.clock.time))
 
+# `AR_SPINUP_STEPS` steps at `AR_SPINUP_DT` (eager CUDA only), first step included, before the main
+# loop. The interpolated initial condition is out of balance and its first steps launch a violent
+# adjustment (ρw −38 after one 40 s step, job 2160); a short spin-up at a small step sheds it, so
+# `AR_DT` then only has to be stable for the adjusted flow. The acoustic substep count stays sized
+# for `AR_DT`, which only over-resolves the acoustics of the smaller spin-up step.
+spinup_steps = parse(Int, get(ENV, "AR_SPINUP_STEPS", "0"))
+Δt_spinup = parse(FT, get(ENV, "AR_SPINUP_DT", "10"))
+spinup_steps > 0 && !VANILLA && error("AR_SPINUP_STEPS requires AR_ARCH=cuda")
+Δt_first = spinup_steps > 0 ? Δt_spinup : Δt
+
 if !isnothing(r_first_time_step!)
     step_start = time_ns()
-    r_first_time_step!(model, Δt)
+    r_first_time_step!(model, Δt_first)
+    VANILLA && accumulate_precipitation!(Δt_first)
     global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
     snapshot!(model)
 end
 
-for n in 1:chunks
+if spinup_steps > 0
+    step_start = time_ns()
+    step_for!(model, Δt_spinup, spinup_steps)
+    stage(@sprintf("spin-up: %d steps at Δt = %s done", spinup_steps, prettytime(Δt_spinup)))
+    global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
+    snapshot!(model)
+end
+
+# ### `AR_ADAPTIVE=1`: an advective-CFL wizard (eager CUDA only)
+#
+# What Oceananigans' `TimeStepWizard` does, written out because the stepped object here is the
+# coupled model rather than a `Simulation`: before every step, Δt = min(AR_CFL · τ, 1.1 · Δt_prev),
+# clamped to [AR_MIN_DT, AR_MAX_DT], where τ = `cell_advection_timescale(child)` — Breeze's
+# direction-aware timescale (three-dimensional, with rain/snow fall speeds in the vertical term,
+# unless every scheme is AIVA). The acoustic substep count follows Δt (`substeps = nothing` above).
+# The run covers the same simulated time as the fixed-Δt run (AR_STEPS · AR_DT) and reports and
+# snapshots every AR_CHUNK · AR_DT seconds; the last steps of each interval are evened out to land
+# on its end. Every step's Δt goes to `timeseries_dt/*` in the output file and to a CSV beside it.
+# Radiation is already on a TimeInterval on this path, so its cadence does not drift with Δt.
+if adaptive_Δt
+    wizard_cfl = parse(Float64, get(ENV, "AR_CFL", "0.7"))
+    wizard_max_Δt = parse(Float64, get(ENV, "AR_MAX_DT", "Inf"))
+    wizard_min_Δt = parse(Float64, get(ENV, "AR_MIN_DT", "1"))
+    wizard_max_change = parse(Float64, get(ENV, "AR_MAX_CHANGE", "1.1"))
+    stage(@sprintf("adaptive Δt: cfl %.2f, max change %.2f, Δt ∈ [%g, %g] s; substeps follow Δt",
+                   wizard_cfl, wizard_max_change, wizard_min_Δt, wizard_max_Δt))
+
+    child = breeze_child(model)
+    advective_timescale() = Float64(Oceananigans.Advection.cell_advection_timescale(child))
+    horizontal_timescale() = Float64(Oceananigans.Advection.cell_advection_timescale(child,
+                                         Oceananigans.TurbulenceClosures.HorizontalFormulation()))
+    substeps_for(Δt) = Breeze.CompressibleEquations.compute_acoustic_substeps(host_grid, FT(Δt),
+                                                                           thermodynamic_constants,
+                                                                           acoustic_cfl)
+    function step_adaptively!(model, Δt_wizard)
+        dt_log = (iteration = Int[], time = Float64[], dt = Float64[], advective_timescale = Float64[],
+                  horizontal_timescale = Float64[], substeps = Int[])
+        clock_time() = Float64(host_number(model.clock.time))
+        t_run_end = clock_time() + steps * Float64(Δt)
+        interval = chunk * Float64(Δt)
+
+        while clock_time() < t_run_end - 0.05
+            step_start = time_ns()
+            t = clock_time()
+            t_target = min(t_run_end, (floor(t / interval + 1e-6) + 1) * interval)
+            n_before = length(dt_log.dt)
+            while t < t_target - 0.05
+                τ = advective_timescale()
+                ## A non-finite timescale means the state already is: stop and keep the record.
+                if !isfinite(τ)
+                    stage(@sprintf("adaptive Δt: non-finite advective timescale at t = %.1f s after a %.2f s step",
+                                   t, isempty(dt_log.dt) ? NaN : last(dt_log.dt)))
+                    global worst_nonfinite = max(worst_nonfinite, 1)
+                    break
+                end
+                Δt_wizard = clamp(min(wizard_cfl * τ, wizard_max_change * Δt_wizard), wizard_min_Δt, wizard_max_Δt)
+                remaining = t_target - t
+                Δt_step = remaining ≤ Δt_wizard ? remaining :
+                          remaining < 2Δt_wizard ? remaining / 2 : Δt_wizard
+                time_step!(model, FT(Δt_step))
+                accumulate_precipitation!(FT(Δt_step))
+                push!(dt_log.iteration, host_number(model.clock.iteration))
+                push!(dt_log.time, clock_time())
+                push!(dt_log.dt, Δt_step)
+                push!(dt_log.advective_timescale, τ)
+                push!(dt_log.horizontal_timescale, horizontal_timescale())
+                push!(dt_log.substeps, substeps_for(Δt_step))
+                t = clock_time()
+            end
+            global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
+            recent = n_before+1:length(dt_log.dt)
+            stage(@sprintf("adaptive Δt over the last %d steps: min %.2f s, mean %.2f s, max %.2f s; substeps %d–%d",
+                           length(recent), minimum(dt_log.dt[recent]), sum(dt_log.dt[recent]) / length(recent),
+                           maximum(dt_log.dt[recent]), minimum(dt_log.substeps[recent]),
+                           maximum(dt_log.substeps[recent])))
+            snapshot!(model)
+            worst_nonfinite > 0 && break
+        end
+        return dt_log
+    end
+
+    dt_log = step_adaptively!(model, Float64(spinup_steps > 0 ? Δt_spinup : Δt))
+
+    if write_output
+        JLD2.jldopen(output_path, "a+") do file
+            for (name, series) in pairs(dt_log)
+                file["timeseries_dt/$name"] = series
+            end
+            file["meta/adaptive"] = (cfl = wizard_cfl, max_Δt = wizard_max_Δt, min_Δt = wizard_min_Δt,
+                                     max_change = wizard_max_change)
+        end
+        csv_path = replace(output_path, r"\.jld2$" => "") * "_dt.csv"
+        open(csv_path, "w") do io
+            println(io, "iteration,time_s,dt_s,advective_timescale_s,horizontal_timescale_s,acoustic_substeps")
+            for n in eachindex(dt_log.dt)
+                println(io, join((dt_log.iteration[n], dt_log.time[n], dt_log.dt[n],
+                                  dt_log.advective_timescale[n], dt_log.horizontal_timescale[n],
+                                  dt_log.substeps[n]), ","))
+            end
+        end
+        stage("wrote the Δt series ($(length(dt_log.dt)) steps) to $(csv_path)")
+    end
+    sorted = sort(dt_log.dt)
+    stage(@sprintf("adaptive Δt over the run: %d steps, min %.2f s, median %.2f s, max %.2f s",
+                   length(sorted), first(sorted), sorted[cld(length(sorted), 2)], last(sorted)))
+end
+
+for n in 1:(adaptive_Δt ? 0 : chunks)
     step_start = time_ns()
     r_step_for!(model, Δt, chunk)
     global worst_nonfinite = max(worst_nonfinite, report(model, 1e-9 * (time_ns() - step_start)))
     snapshot!(model)
+    ## A NaN never heals: stop rather than step (and write) garbage for the rest of the run.
+    worst_nonfinite > 0 && break
 end
 
 # One unambiguous verdict line, so the run answers "are there NaNs after stepping?" without anyone

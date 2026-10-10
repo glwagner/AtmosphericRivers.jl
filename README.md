@@ -28,6 +28,8 @@ corridor; the moisture traced back ~11,000 km to the western Pacific.
 | `predownload.jl` | Fetch all ERA5 files up front (CDS queue is the bottleneck, not bytes) |
 | `visualize_era5.jl` | Model-free ERA5 view of the event: IVT maps + animation, coastal AR-scale time series, landfall precipitation |
 | `downscale.jl` | ERA5 → 12 km Breeze nest with prescribed-SST ocean coupling + RRTMGP |
+| `reactant_downscale.jl` | The landfall nest with a hand-rolled ERA5 parent, runnable eagerly on CUDA (`AR_ARCH=cuda`) or compiled with Reactant, plus the Enzyme adjoint (`AR_AD=1`) |
+| `analysis/render_precipitation.jl` | 24 h accumulated precipitation of a `reactant_downscale.jl` CUDA run against ERA5 |
 | `slurm/*.batch` | Batch scripts (instantiate, predownload, visualize, downscale) |
 
 ## Workflow
@@ -51,6 +53,24 @@ moist-state fixes. NumericalEarth points at `glw/bottom-precipitation-flux`
 `PrescribedOcean` on Breeze `main`); switch it to `rev = "main"` once #753 merges. The
 Manifest pins the exact commits, and `Pkg.update()` moves both forward. Resolve with
 Julia 1.12 (the Manifest's `julia_version`).
+
+## 12 km landfall nest on one H100 (`reactant_downscale.jl`, 2026-10-09)
+
+```bash
+sbatch slurm/instantiate_prod.batch    # fill ~/.julia-prod once (gpuprod = H100 80GB)
+sbatch --export=ALL,AR_SKIP_SETUP=1,AR_PARENT_HOURS=25,AR_RUN_HOURS=24,AR_CHUNK=360,AR_RUN_BAL=0 \
+       slurm/cuda_hydro_long.batch     # 24 h from 2025-12-07T12, eager CUDA, Δt = 10 s
+julia --project=. analysis/render_precipitation.jl reactant_landfall_era5_9cpd_cuda_hydro_24h_dt10_etopo_nobal.jld2
+```
+
+The 324×162×50 child (9 cells per degree, landfall box) with the hydrostatic ERA5 parent,
+prescribed-ocean coupling, hourly RRTMGP and ETOPO2022 terrain (`AR_TERRAIN=etopo`, the
+default; 2 smoothing passes) runs 24 h at Δt = 10 s in ~4 min of stepping on an H100:
+26 ms per step, ~380× real time, 1.0×10⁸ cell-steps per second. Snapshots carry the
+running surface precipitation total (`accumulated_precipitation`, mm). Over SW Washington
+and NW Oregon west of the Cascades the first 24 h total is 12.6 mm against ERA5's 12.3 mm.
+Δt = 30 and 40 s blow up from the first-step initialization kick; `AR_SPINUP_STEPS` /
+`AR_SPINUP_DT` start the run at a smaller step.
 
 ## Configuration (v0: one A100-40GB)
 

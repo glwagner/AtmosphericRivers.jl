@@ -1,0 +1,43 @@
+#!/bin/bash
+#SBATCH --job-name=ar-closure
+#SBATCH --partition=gpuprod,gpuprodflex,gpua100largex4spot
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
+#SBATCH --time=04:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# One arm of the turbulence-closure comparison (analysis/compare_closures.jl): the 24 h 12 km
+# real-terrain case at Δt = 10 s with AR_CLOSURE / AR_TKE_FLAVOR from the environment, run either in
+# the shared root project (Breeze main) or in a project that develops Breeze #975
+# (AR_CLOSURE_PROJECT, e.g. ~/AtmosphericRivers-975/env-975). Private first depot so recompiles for
+# this host never touch the shared ~/.julia-prod caches.
+#
+#   sbatch --export=ALL,AR_TAG=main,AR_TKE_FLAVOR=main slurm/closure975_compare.batch
+#   sbatch --export=ALL,AR_TAG=pr975,AR_TKE_FLAVOR=default,AR_CLOSURE_PROJECT=$HOME/AtmosphericRivers-975/env-975 slurm/closure975_compare.batch
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="${AR_DEPOT:-$HOME/.julia-975}:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
+export HDF5_USE_FILE_LOCKING=FALSE
+JULIA=~/.juliaup/bin/julia
+PROJECT=${AR_CLOSURE_PROJECT:-.}
+nvidia-smi --query-gpu=name --format=csv
+
+DT=${AR_DT:-10}
+HOURS=${AR_RUN_HOURS:-24}
+export AR_ARCH=cuda AR_DOMAIN=landfall AR_CELLS_PER_DEGREE=9
+export AR_PARENT=era5 AR_PARENT_HOURS=$(( HOURS + 1 )) AR_ERA5_REGION=-170.5,-109.5,24.5,60.5
+export AR_PARENT_UNIFORM_Z=1 AR_PARENT_PRESSURE=${AR_PARENT_PRESSURE:-column} AR_IC=interpolated AR_BALANCER=0
+export AR_COUPLED=1 AR_FLUX_ITERATIONS=10 AR_RADIATION=1 AR_RADIATION_EVERY=$(( 3600 / DT ))
+export AR_SOLAR=apparent AR_SST=${AR_SST:-era5}
+export AR_TERRAIN=etopo AR_TERRAIN_SMOOTHING=${AR_TERRAIN_SMOOTHING:-2}
+export AR_DT=$DT AR_STEPS=$(( HOURS * 3600 / DT )) AR_CHUNK=$(( 1800 / DT )) AR_SPONGE=1
+export AR_CLOSURE=${AR_CLOSURE:-tke} AR_TKE_FLAVOR=${AR_TKE_FLAVOR:-main} AR_OUTPUT_CLOSURE=1
+export AR_OUTPUT=1 AR_OUTPUT_FILE=runs/closure975/landfall_9cpd_${HOURS}h_dt${DT}_${AR_TAG:-$AR_TKE_FLAVOR}.jld2
+env | grep '^AR_' | sort
+echo "=== [$(date -Is)] project $PROJECT ==="
+stdbuf -oL -eL $JULIA --startup-file=no --project=$PROJECT -t auto reactant_downscale.jl
+status=$?
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status

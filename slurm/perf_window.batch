@@ -1,0 +1,61 @@
+#!/bin/bash
+#SBATCH --job-name=ar-perfwin
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=150G
+#SBATCH --time=03:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Profile the production forward configuration (perf/profile_window.jl) in one closure arm:
+# AR_PERF_TAG names the outputs, AR_PERF_PROJECT the Julia project, AR_CLOSURE / AR_TKE_FLAVOR the
+# closure. Runs twice: CUPTI trace + timings + host profile, then (AR_PERF_NSYS=1) under nsys.
+# Setup mirrors slurm/closure975_compare.batch. Private first depot ~/.julia-perf.
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-perf:$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
+export HDF5_USE_FILE_LOCKING=FALSE
+JULIA=~/.juliaup/bin/julia
+PROJECT=${AR_PERF_PROJECT:-$HOME/AtmosphericRivers-975/env-975}
+GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | awk '{print $2}')
+nvidia-smi --query-gpu=name,clocks.max.sm,clocks.max.mem --format=csv
+
+DT=${AR_DT:-10}
+export AR_ARCH=cuda AR_DOMAIN=landfall AR_CELLS_PER_DEGREE=9
+export AR_PARENT=era5 AR_PARENT_HOURS=${AR_PARENT_HOURS:-6} AR_ERA5_REGION=-170.5,-109.5,24.5,60.5
+export AR_PARENT_UNIFORM_Z=1 AR_PARENT_PRESSURE=${AR_PARENT_PRESSURE:-column} AR_IC=interpolated AR_BALANCER=0
+export AR_COUPLED=1 AR_FLUX_ITERATIONS=10 AR_RADIATION=1 AR_RADIATION_EVERY=$(( 3600 / DT ))
+export AR_SOLAR=apparent AR_SST=${AR_SST:-era5}
+export AR_TERRAIN=etopo AR_TERRAIN_SMOOTHING=${AR_TERRAIN_SMOOTHING:-2}
+export AR_DT=$DT AR_STEPS=10 AR_CHUNK=10 AR_SPONGE=1 AR_OUTPUT=0 AR_OUTPUT_CLOSURE=1
+export AR_CLOSURE=${AR_CLOSURE:-tke} AR_TKE_FLAVOR=${AR_TKE_FLAVOR:-default}
+TAG=${AR_PERF_TAG:-$AR_CLOSURE-$AR_TKE_FLAVOR}_$GPU
+env | grep '^AR_' | sort
+echo "=== [$(date -Is)] project $PROJECT, tag $TAG ==="
+
+if [ "$PROJECT" != "$HOME/AtmosphericRivers-975/env-975" ]; then
+    $JULIA --startup-file=no --project=$PROJECT -e 'using Pkg; Pkg.instantiate()' || exit 1
+fi
+
+CMD="$JULIA --startup-file=no --project=$PROJECT -t auto perf/profile_window.jl"
+echo "julia_launch_unix $(date +%s.%N)"
+mkdir -p perf/data perf/nsys
+if [ "${AR_PERF_CUPTI_PASS:-1}" = "1" ]; then
+    AR_PROF_OUT=perf/data/$TAG stdbuf -oL -eL $CMD
+    echo "=== [$(date -Is)] CUPTI run done (exit $?) ==="
+fi
+
+if [ "${AR_PERF_NSYS:-1}" = "1" ]; then
+    ## One Julia thread: nsys 2023.4's importer rejects the trace ("Wrong event order has been detected")
+    ## when CUDA.jl's synchronization worker thread issues driver calls alongside the main thread.
+    AR_PROF_OUT=perf/data/${TAG}_nsysrun AR_PROF_NSYS=1 AR_PROF_CUPTI=0 AR_PROF_HOSTPROF=0 \
+    nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --trace=cuda,nvtx \
+        --sample=none --cpuctxsw=none -o perf/nsys/$TAG --force-overwrite=true \
+        stdbuf -oL -eL ${CMD/-t auto/-t ${AR_NSYS_THREADS:-1}}
+    echo "=== [$(date -Is)] nsys run done (exit $?) ==="
+    if [ -f perf/nsys/$TAG.nsys-rep ]; then
+        nsys stats --report cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum --format csv \
+            -o perf/nsys/$TAG perf/nsys/$TAG.nsys-rep
+    fi
+fi
+echo "=== [$(date -Is)] all done ==="

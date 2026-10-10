@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --job-name=ar-analysis
+#SBATCH --partition=gpuprod
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=60G
+#SBATCH --time=02:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Run one analysis/ script (no GPU needed) on a compute node of the type the prod depot was precompiled on (the
+# login node re-precompiles CairoMakie and contends for the depot's pidfile locks).
+#   sbatch slurm/analysis.batch analysis/<script>.jl args…
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
+export HDF5_USE_FILE_LOCKING=FALSE
+~/.juliaup/bin/julia --startup-file=no --project=. "$@"
