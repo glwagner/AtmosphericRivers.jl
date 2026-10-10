@@ -1831,6 +1831,20 @@ else
     scalar_advection = explicit_scalar_advection
 end
 
+## The TKE tracer ρe is not in NumericalEarth's `default_nested_scalar_advection`, and a tracer missing
+## from a NamedTuple `tracer_advection` falls back to Oceananigans' default — second-order `Centered`,
+## unbounded (`validate_tracer_advection(::NamedTuple, grid) = Centered(), tuple`), which let e go
+## negative and overshoot. Give it the same bounds-preserving WENO(5) as the moisture, limited below
+## at 0 on the specific TKE e = ρe/ρ. The upper bound only has to be finite (an `Inf` would put
+## Inf/x terms into the limiter, and its derivative, for nothing): `AR_TKE_MAX`, m² s⁻², never binding.
+if closure_kind == "tke"
+    tke_max = parse(Float64, get(ENV, "AR_TKE_MAX", "1e4"))
+    tke_time_discretization = aiva ? (; time_discretization = implicit_vertical) : (;)
+    scalar_advection = merge(scalar_advection,
+                             (ρe = WENO(order = 5, bounds = (0, tke_max); tke_time_discretization...),))
+end
+stage("scalar advection: " * join(("$(name) => $(summary(scheme))" for (name, scheme) in pairs(scalar_advection)), ", "))
+
 # ### Shim 5: a host-decided acoustic substep count
 #
 # Δt has to be known here, not at the stepping section below, because the split-explicit dynamics
