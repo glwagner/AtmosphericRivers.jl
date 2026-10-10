@@ -28,8 +28,20 @@ parse_kernel_rules(s) = [Regex(first(split(r, '='))) => parse(Int, last(split(r,
 const DEFAULT_KERNEL_BLOCKS_PER_SM = "x_momentum_tendency=2,default_microphysical_tendencies=4," *
     "potential_temperature_tendency=4,z_momentum_tendency=3,y_momentum_tendency=3,compute_scalar_tendency=3,interface_state=3"
 
+# With Oceananigans #6211 (static-size device arrays for Field data) registers already drop (ρu 159 → 128, scalars
+# → 64), so ρu needs no cap and the acoustic `build_vertical_rhs` gains one instead (H100 job 2576: GPU 26.1 → 21.8
+# ms/step together with #6211, bitwise identical). Chosen automatically when the CUDA extension defines the array.
+const DEFAULT_KERNEL_BLOCKS_PER_SM_6211 = "default_microphysical_tendencies=4,potential_temperature_tendency=4," *
+    "build_vertical_rhs=4,y_momentum_tendency=3,z_momentum_tendency=4,add_sedimentation_tendency=4"
+
+function default_kernel_rules()
+    ext = Base.get_extension(Oceananigans, :OceananigansCUDAExt)
+    return !isnothing(ext) && isdefined(ext, :StaticSizeDeviceArray) ? DEFAULT_KERNEL_BLOCKS_PER_SM_6211 :
+                                                                       DEFAULT_KERNEL_BLOCKS_PER_SM
+end
+
 const KERNEL_BLOCKS_PER_SM = parse_kernel_rules(get(ENV, "AR_KERNEL_BLOCKS_PER_SM",
-                                                    get(ENV, "AR_KERNEL_TUNING", "0") == "1" ? DEFAULT_KERNEL_BLOCKS_PER_SM : ""))
+                                                    get(ENV, "AR_KERNEL_TUNING", "0") == "1" ? default_kernel_rules() : ""))
 const KERNEL_MAXREGS       = parse_kernel_rules(get(ENV, "AR_KERNEL_MAXREGS", ""))
 const KERNEL_TUNED         = Dict{String, Any}()
 
