@@ -2176,8 +2176,11 @@ elseif ic_mode === :interpolated
             end
             f
         end
+        ## The twin's parent pressure is the DEVICE parent's, whatever `AR_PARENT_PRESSURE` built
+        ## (isa / hydrostatic / column) — it used to be the isothermal placeholder unconditionally, so the
+        ## IC was balanced against a different pressure than the boundaries and relaxation then imposed.
         cpu_pressure = CenterField(cpu_pgrid)
-        set!(cpu_pressure, (λ, φ, z) -> isa_pressure(z))
+        copyto!(parent(cpu_pressure), Array(parent(parent_pressure)))
         cpu_parent = PrescribedAtmosphere(cpu_pgrid, parent_times;
                                           velocities = (u = cpu_fts(u_parent), v = cpu_fts(v_parent)),
                                           temperature = cpu_fts(T_parent),
