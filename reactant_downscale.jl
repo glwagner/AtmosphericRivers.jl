@@ -1869,6 +1869,29 @@ end
 
 closure = closure_kind == "tke" ? build_closure(FT) : nothing
 
+# ### Shim 15 (`AR_AD_SAFE_MICROPHYSICS`, default on under `AR_AD=1`): λ⁻¹ without 0/0 in reverse mode
+#
+# CloudMicrophysics' 1M `lambda_inverse` clamps q at 0 and takes `(ρ q r0^… / denom)^(1/(me+Δm+1))`,
+# which Julia evaluates as `exp(p · log x)`. Wherever q ≤ 0 — every rain/snow-free cell, and every
+# cell whose condensate went slightly negative — x = 0, the primal is fine (exp(−∞) = 0, then floored),
+# but the reverse pass computes ∂log/∂x = adjoint / x = 0/0 = NaN, which no strong-zero rule catches
+# (it is a division). Floor q and ρ at `ϵ_numerics` instead of 0: identical wherever q > ϵ (where the
+# callers' `ifelse(q > ϵ, rate, 0)` gates make the result matter), finite derivatives everywhere.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_MICROPHYSICS", "1") == "1"
+    @eval CloudMicrophysics.Microphysics1M @inline function lambda_inverse(
+            pdf::Union{CMP.ParticlePDFIceRain, CMP.ParticlePDFSnow}, mass::CMP.ParticleMass, q, ρ)
+        FT = UT.promote_typeof(q, ρ)
+        n0 = get_n0(pdf, q, ρ)
+        (; r0, m0, me, Δm, χm, gamma_coeff) = mass
+        qp = max(q, UT.ϵ_numerics(q))
+        ρp = max(ρ, UT.ϵ_numerics(ρ))
+        denom = χm * m0 * max(n0, UT.ϵ_numerics(n0)) * gamma_coeff
+        λ_inv = (ρp * qp * r0^(me + Δm) / denom)^(1 / (me + Δm + 1))
+        return max(r0 * FT(1e-5), λ_inv)
+    end
+    @info "shim 15: AD-safe CloudMicrophysics 1M lambda_inverse (q, ρ floored at ϵ_numerics)"
+end
+
 # ### Shim 14 (`AR_AD_SAFE_TKE`, default on under `AR_AD=1`): no infinite derivatives in the TKE closure
 #
 # Breeze's TKE closure evaluates `√N²⁺` and `√|e|` where both can be exactly 0, and hides the result
