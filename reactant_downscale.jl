@@ -1817,6 +1817,49 @@ function build_closure(FT)
 end
 
 closure = closure_kind == "tke" ? build_closure(FT) : nothing
+
+# ### Shim 14 (`AR_AD_SAFE_TKE`, default on under `AR_AD=1`): no infinite derivatives in the TKE closure
+#
+# Breeze's TKE closure evaluates `√N²⁺` and `√|e|` where both can be exactly 0, and hides the result
+# behind an `ifelse` (ℓᴺ = Inf where N² ≤ 0; ω = 1/τ where e < 0). The primal is fine; the adjoint is
+# not — reverse mode propagates a zero adjoint into the unselected branch and multiplies it by the
+# infinite derivative of √ at 0, 0·∞ = NaN, which then floods every cell. (The TKE + column AD run 2410
+# gave a finite 1 h gradient and an all-NaN 6 h one.) Floor both radicands at a value far below
+# anything physical (N² ≥ 1e-12 s⁻², |e| ≥ 1e-10 m² s⁻²), which keeps every derivative finite and
+# changes no selected branch's value measurably.
+if closure_kind == "tke" && get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_TKE", "1") == "1" &&
+   isdefined(Breeze.TurbulenceClosures, :stratification_mixing_lengthᶜᶜᶠ) &&
+   isdefined(Breeze.TurbulenceClosures, :tke_sink_rate)
+    @eval Breeze.TurbulenceClosures begin
+        @inline function stratification_mixing_lengthᶜᶜᶠ(i, j, k, grid, closure, e, tracers, buoyancy)
+            FT = eltype(grid)
+            N²⁺ = clip(∂z_b(i, j, k, grid, buoyancy, tracers))
+            ℓᴺ = closure.mixing_length.Cᴺ * ℑzᵃᵃᶠ(i, j, k, grid, turbulent_velocityᶜᶜᶜ, closure, e) /
+                 sqrt(max(N²⁺, FT(1e-12)))
+            return ifelse(N²⁺ == 0, FT(Inf), ℓᴺ)
+        end
+        @inline function stratification_mixing_lengthᶜᶜᶜ(i, j, k, grid, closure, e, tracers, buoyancy)
+            FT = eltype(grid)
+            N²⁺ = clip(ℑbzᵃᵃᶜ(i, j, k, grid, ∂z_b, buoyancy, tracers))
+            ℓᴺ = closure.mixing_length.Cᴺ * turbulent_velocityᶜᶜᶜ(i, j, k, grid, closure, e) /
+                 sqrt(max(N²⁺, FT(1e-12)))
+            return ifelse(N²⁺ == 0, FT(Inf), ℓᴺ)
+        end
+        @inline function tke_sink_rate(i, j, k, grid, closure, e, B, velocities, tracers, buoyancy)
+            FT = eltype(grid)
+            eᵐⁱⁿ = closure.minimum_tke
+            eᵢ = @inbounds e[i, j, k]
+            ℓ = mixing_lengthᶜᶜᶜ(i, j, k, grid, closure, e, tracers, buoyancy)
+            Sᴰ = dissipation_stability_functionᶜᶜᶜ(i, j, k, grid, closure, velocities, tracers, buoyancy)
+            τ = closure.negative_tke_damping_time_scale
+            ω = ifelse(eᵢ < 0, 1 / τ, Sᴰ * sqrt(max(abs(eᵢ), FT(1e-10))) / ℓ)
+            B⁻ = min(0, B)
+            ωᴮ = -B⁻ / max(eᵢ, eᵐⁱⁿ) * (eᵢ > eᵐⁱⁿ)
+            return ω + ωᴮ
+        end
+    end
+    @info "shim 14: AD-safe TKE closure (√ radicands floored at N² ≥ 1e-12, |e| ≥ 1e-10)"
+end
 initial_tke = parse(FT, get(ENV, "AR_TKE_INITIAL", "1e-3"))
 stage("turbulence closure: $(isnothing(closure) ? "none" : summary(closure))")
 explicit_scalar_advection = breeze_extension.default_nested_scalar_advection(microphysics)
