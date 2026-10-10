@@ -1721,7 +1721,10 @@ stage(@sprintf("parent ready: %d×%d×%d PrescribedAtmosphere over [%.2f, %.2f]�
 
 relax_width = parse(Int, get(ENV, "AR_RELAX_WIDTH", "5"))
 ## `AR_RELAX_TIMESCALE` (seconds, default 300) sets the Davies relaxation rate 1/τ at the frame.
-relax_rate = 1 / parse(Float64, get(ENV, "AR_RELAX_TIMESCALE", "300"))
+## `off` drops the interior relaxation forcing altogether (`relaxation_rate = nothing`) — not a physical
+## configuration: it exists to measure what the in-kernel Davies forcing costs (perf/PROFILE_REPORT.md).
+relax_rate = get(ENV, "AR_RELAX_TIMESCALE", "300") == "off" ? nothing :
+             1 / parse(Float64, get(ENV, "AR_RELAX_TIMESCALE", "300"))
 aiva = get(ENV, "AR_AIVA", "0") == "1"
 
 # ### The traced clock
