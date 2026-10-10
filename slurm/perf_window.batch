@@ -40,13 +40,15 @@ fi
 CMD="$JULIA --startup-file=no --project=$PROJECT -t auto perf/profile_window.jl"
 echo "julia_launch_unix $(date +%s.%N)"
 mkdir -p perf/data perf/nsys
-AR_PROF_OUT=perf/data/$TAG stdbuf -oL -eL $CMD
-echo "=== [$(date -Is)] CUPTI run done (exit $?) ==="
+if [ "${AR_PERF_CUPTI_PASS:-1}" = "1" ]; then
+    AR_PROF_OUT=perf/data/$TAG stdbuf -oL -eL $CMD
+    echo "=== [$(date -Is)] CUPTI run done (exit $?) ==="
+fi
 
 if [ "${AR_PERF_NSYS:-1}" = "1" ]; then
-    AR_PROF_OUT=perf/data/${TAG}_nsysrun AR_PROF_NSYS=1 AR_PROF_CUPTI=0 \
     ## One Julia thread: nsys 2023.4's importer rejects the trace ("Wrong event order has been detected")
     ## when CUDA.jl's synchronization worker thread issues driver calls alongside the main thread.
+    AR_PROF_OUT=perf/data/${TAG}_nsysrun AR_PROF_NSYS=1 AR_PROF_CUPTI=0 AR_PROF_HOSTPROF=0 \
     nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --trace=cuda,nvtx \
         --sample=none --cpuctxsw=none -o perf/nsys/$TAG --force-overwrite=true \
         stdbuf -oL -eL ${CMD/-t auto/-t ${AR_NSYS_THREADS:-1}}
