@@ -1495,7 +1495,7 @@ if get(ENV, "AR_PARENT", "analytic") == "era5"
     end
 end
 
-# ## `AR_PARENT_PRESSURE` (default `hydrostatic`): a parent pressure the parent's own temperature can hold up
+# ## `AR_PARENT_PRESSURE` (`column` for ERA5, else `hydrostatic`): a parent pressure the parent's own temperature can hold up
 #
 # The placeholder above pairs every parent level with the pressure of an ISOTHERMAL 288.15 K column
 # at that height — the same map that placed the levels. The exchanger then forms the child's
@@ -1517,7 +1517,12 @@ end
 # arithmetic vertical index are unaffected.
 #
 # `AR_PARENT_PRESSURE=isa` keeps the isothermal placeholder, i.e. reproduces the old behaviour.
-if get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "hydrostatic"
+## Default `column` for the ERA5 parent (per-column balance; the domain-mean profile left every wall out of
+## balance by ~T′/T̄ — a 6× larger step-1 frame kick, DT_SWEEP.md), `hydrostatic` for the analytic parent,
+## which has no msl field to anchor columns on.
+parent_pressure_mode = get(ENV, "AR_PARENT_PRESSURE",
+                           get(ENV, "AR_PARENT", "analytic") == "era5" ? "column" : "hydrostatic")
+if parent_pressure_mode == "hydrostatic"
     let constants64 = Breeze.ThermodynamicConstants(Float64),
         Rᵈ = Breeze.dry_air_gas_constant(constants64),
         Rᵛ = Breeze.vapor_gas_constant(constants64),
@@ -1603,7 +1608,7 @@ if get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "hydrostatic"
         end
         copyto!(parent(parent_pressure), p_host)
     end
-elseif get(ENV, "AR_PARENT_PRESSURE", "hydrostatic") == "column"
+elseif parent_pressure_mode == "column"
     ## `AR_PARENT_PRESSURE=column`: the same hydrostatic integration, but PER COLUMN — each parent
     ## column's own Tᵛ profile, anchored at that column's ERA5 mean-sea-level pressure at `start_date`
     ## (the parent is flat, so z = 0 is sea level). The domain-mean profile above is horizontally
