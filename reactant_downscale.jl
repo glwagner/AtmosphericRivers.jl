@@ -3577,7 +3577,7 @@ if get(ENV, "AR_AD", "0") == "1"
         ## plateaus at that factor instead. The loss executable is already compiled, so each extra ε
         ## costs one evaluation, not one compile.
         fd_dir = get(ENV, "AR_AD_FD_DIR", "")
-        fd_eps_list = [parse(Float64, x) for x in split(get(ENV, "AR_AD_FD_EPS", "1e-3"), ',')
+        fd_eps_list = [parse(Float64, x) for x in split(get(ENV, "AR_AD_FD_EPS", "1e-3"), [',', ':'])
                        if !isempty(strip(x))]
 
         ## The control's own bytes, saved BEFORE anything is evaluated. Reading the perturbation base
