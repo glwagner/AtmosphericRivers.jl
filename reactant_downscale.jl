@@ -2338,7 +2338,8 @@ end
 ## Seed the TKE: every IC path above leaves ρe at zero (the parent carries no turbulence), and at
 ## e = 0 the closure's √e diffusivities and shear production stay zero forever.
 if haskey(prognostic_fields(child), :ρe)
-    interior(prognostic_fields(child).ρe) .= initial_tke .* interior(prognostic_fields(child).ρᵈ)
+    ## Whole-parent host round trip: a broadcast over `interior` views of Reactant arrays scalar-indexes.
+    copyto!(parent(prognostic_fields(child).ρe), initial_tke .* Array(parent(prognostic_fields(child).ρᵈ)))
     VANILLA && Oceananigans.TimeSteppers.update_state!(nest)
     stage("TKE seeded: ρe = $(initial_tke) m² s⁻² × ρᵈ")
 end
