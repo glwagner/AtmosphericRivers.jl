@@ -1961,6 +1961,36 @@ if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_SECANT", "1") == "1"
     @info "shim 16: AD-safe secant step in saturation adjustment (no 0/0 once converged)"
 end
 
+# ### Shim 17 (`AR_AD_FROZEN_K`, default on under `AR_AD=1` with TKE): frozen-diffusivity adjoint
+#
+# With the TKE closure the adjoint does not just pick up a stray NaN — it EXPLODES: production config, 3 h
+# window, median |∂J/∂ρqᵉ| = 7e10 and max 1e16 everywhere (job 2608), NaN by 6 h; without a closure the same
+# loss gives O(1–30) at 6 h. The tangent-linear of nonlinear vertical diffusion, ∂z(K(e, N², ℓ) ∂z c),
+# carries ∂z(K′ δe ∂z c), which is anti-diffusive wherever ∂K/∂e is large (K ∝ ℓ√e, and √e is floored
+# at e_min = 1e-6, so ∂K/∂e ~ 1/(2√e_min) = 500 where the TKE is quiet) — the well-known reason
+# operational 4D-Var adjoints use a simplified/"frozen-K" boundary-layer adjoint (Mahfouf 1999; Janisková
+# et al. 1999). So: the primal is unchanged, but the closure fields (diffusivities, mixing length, N², the
+# implicit TKE sink) are passed through `ignore_derivatives` after every computation. The gradient then
+# omits sensitivity THROUGH the turbulence coefficients — mixing still acts on the perturbations, with the
+# coefficients of the reference trajectory — which is the standard, documented approximation.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_FROZEN_K", "1") == "1" &&
+   isdefined(Breeze.TurbulenceClosures, :FlavorOfTKEClosure)
+    @eval function Oceananigans.TurbulenceClosures.compute_closure_fields!(closure_fields,
+                closure::Breeze.TurbulenceClosures.FlavorOfTKEClosure,
+                model::Breeze.AtmosphereModel{<:Any, <:Any, <:ReactantState}; parameters = :xyz)
+        invoke(Oceananigans.TurbulenceClosures.compute_closure_fields!,
+               Tuple{Any, Breeze.TurbulenceClosures.FlavorOfTKEClosure, Any},
+               closure_fields, closure, model; parameters)
+        for f in values(closure_fields)
+            f isa Oceananigans.Fields.AbstractField || continue
+            data = parent(f)
+            data isa Reactant.TracedRArray && (data .= Reactant.Ops.ignore_derivatives(data))
+        end
+        return nothing
+    end
+    @info "shim 17: frozen-diffusivity adjoint (closure fields pass through ignore_derivatives)"
+end
+
 # ### Shim 14 (`AR_AD_SAFE_TKE`, default on under `AR_AD=1`): no infinite derivatives in the TKE closure
 #
 # Breeze's TKE closure evaluates `√N²⁺` and `√|e|` where both can be exactly 0, and hides the result
