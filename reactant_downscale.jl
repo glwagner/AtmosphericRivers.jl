@@ -1915,6 +1915,52 @@ if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_MICROPHYSICS", "1") == 
     @info "shim 15: AD-safe CloudMicrophysics 1M lambda_inverse (q, ρ floored at ϵ_numerics)"
 end
 
+# ### Shim 16 (`AR_AD_SAFE_SECANT`, default on under `AR_AD=1`): a secant step with no 0/0 in reverse
+#
+# Saturation adjustment solves for T with Breeze's secant iteration, `Δx/Δr = (x₂ - x₁) / (r₂ - r₁)`,
+# guarded in the primal by `ifelse(isfinite(Δx/Δr), Δx/Δr, 0)` — once a cell converges, r₂ == r₁ and
+# x₂ == x₁, so the division is 0/0. The primal discards it; the reverse pass does not: the quotient
+# rule computes `-adjoint · Δx / Δr²` = 0/0 = NaN for every converged saturated cell, and the gradient
+# floods. That is why the adjoint goes all-NaN only after hours (more saturated, converged cells) with
+# a perfectly finite primal (jobs 2381, 2433, 2552: finite at 9 h, all-NaN at 12 h). Divide by a safe
+# denominator instead, selected BEFORE the division, so neither branch ever divides by zero.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_SECANT", "1") == "1"
+    @eval Breeze.Solvers begin
+        @inline function safe_secant_slope(x₁, x₂, r₁, r₂)
+            Δr = r₂ - r₁
+            degenerate = (Δr == 0) | !isfinite(Δr)
+            slope = (x₂ - x₁) / ifelse(degenerate, one(Δr), Δr)
+            return ifelse(degenerate | !isfinite(slope), zero(slope), slope), !degenerate
+        end
+        @inline function secant_solve(residual, solver::SecantSolver, x₁, x₂, scale)
+            r₁ = residual(x₁)
+            r₂ = residual(x₂)
+            iter = 0
+            while abs(r₂) > max(solver.abstol, solver.reltol * abs(scale)) && iter < solver.maxiter
+                ΔxΔr, valid_step = safe_secant_slope(x₁, x₂, r₁, r₂)
+                x₁, r₁ = x₂, r₂
+                x₂ -= r₂ * ΔxΔr
+                r₂ = residual(x₂)
+                r₂ = ifelse(valid_step, r₂, zero(r₂))
+                iter += 1
+            end
+            return x₂
+        end
+        @inline function secant_solve(residual, solver::FixedIterations, x₁, x₂, scale)
+            r₁ = residual(x₁)
+            r₂ = residual(x₂)
+            for _ in 1:solver.iterations
+                ΔxΔr, _ = safe_secant_slope(x₁, x₂, r₁, r₂)
+                x₁, r₁ = x₂, r₂
+                x₂ -= r₂ * ΔxΔr
+                r₂ = residual(x₂)
+            end
+            return x₂
+        end
+    end
+    @info "shim 16: AD-safe secant step in saturation adjustment (no 0/0 once converged)"
+end
+
 # ### Shim 14 (`AR_AD_SAFE_TKE`, default on under `AR_AD=1`): no infinite derivatives in the TKE closure
 #
 # Breeze's TKE closure evaluates `√N²⁺` and `√|e|` where both can be exactly 0, and hides the result
