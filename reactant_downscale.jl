@@ -1865,6 +1865,41 @@ if closure_kind == "tke" && get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAF
     end
     @info "shim 14: AD-safe TKE closure (√ radicands floored at N² ≥ 1e-12, |e| ≥ 1e-10)"
 end
+
+## The same hazards in Breeze #975's closure (env-975 / env-micro: GradientLimitedMixingLength, N² stored
+## in closure_fields), whose functions carry different names and signatures.
+if closure_kind == "tke" && get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_TKE", "1") == "1" &&
+   isdefined(Breeze.TurbulenceClosures, :buoyancy_penetration_depthᶜᶜᶠ)
+    @eval Breeze.TurbulenceClosures begin
+        @inline function buoyancy_penetration_depthᶜᶜᶠ(i, j, k, grid, closure, e, N²)
+            FT = eltype(grid)
+            N²⁺ = clip(@inbounds N²[i, j, k])
+            ℓᵇ = ℑzᵃᵃᶠ(i, j, k, grid, turbulent_velocityᶜᶜᶜ, closure, e) / sqrt(max(N²⁺, FT(1e-12)))
+            return ifelse(N²⁺ == 0, FT(Inf), ℓᵇ)
+        end
+        @inline function local_mixing_lengthᶜᶜᶜ(i, j, k, grid, closure, e, N²)
+            FT = eltype(grid)
+            d = closure.mixing_length.Cˢ * height_above_bottomᶜᶜᶜ(i, j, k, grid)
+            N²⁺ = clip(ℑbzᵃᵃᶜ(i, j, k, grid, face_valueᶜᶜᶠ, N²))
+            ℓᵇ = turbulent_velocityᶜᶜᶜ(i, j, k, grid, closure, e) / sqrt(max(N²⁺, FT(1e-12)))
+            ℓ = min(d, ifelse(N²⁺ == 0, FT(Inf), ℓᵇ))
+            return ifelse(isnan(ℓ), d, ℓ)
+        end
+        @inline function tke_sink_rate(i, j, k, grid, closure, e, B, velocities, closure_fields)
+            FT = eltype(grid)
+            eᵐⁱⁿ = closure.minimum_tke
+            eᵢ = @inbounds e[i, j, k]
+            ℓ = mixing_lengthᶜᶜᶜ(i, j, k, grid, closure, e, closure_fields)
+            Sᴰ = dissipation_stability_functionᶜᶜᶜ(i, j, k, grid, closure, velocities, closure_fields.N²)
+            τ = closure.negative_tke_damping_time_scale
+            ω = ifelse(eᵢ < 0, 1 / τ, Sᴰ * sqrt(max(abs(eᵢ), FT(1e-10))) / ℓ)
+            B⁻ = min(0, B)
+            ωᴮ = -B⁻ / max(eᵢ, eᵐⁱⁿ) * (eᵢ > eᵐⁱⁿ)
+            return ω + ωᴮ
+        end
+    end
+    @info "shim 14 (#975 closure): AD-safe buoyancy penetration depth, local mixing length, TKE sink"
+end
 initial_tke = parse(FT, get(ENV, "AR_TKE_INITIAL", "1e-3"))
 stage("turbulence closure: $(isnothing(closure) ? "none" : summary(closure))")
 explicit_scalar_advection = breeze_extension.default_nested_scalar_advection(microphysics)
