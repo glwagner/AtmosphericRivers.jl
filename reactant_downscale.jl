@@ -158,6 +158,20 @@ using Reactant: @code_hlo, @compile, @jit, @trace
 
 include("case.jl")
 
+# ## `AR_FUSED_HALOS` (default 1): fused tuple halo filling
+#
+# With an Oceananigans that has fused tuple halo filling (`Fields.FUSED_HALO_FILLING`, the
+# opt/halo-fusion branch), `fill_halo_regions!` on a tuple of fields launches one kernel per
+# side-pair for every run of fields whose boundary conditions are "local" — read only their own
+# data — instead of one launch per field per side-pair. NumericalEarth's parent lateral-BC
+# condition `Interpolated` reads only its own parent FieldTimeSeries, so it is declared local here.
+# `AR_FUSED_HALOS=0` restores the per-field path (bitwise-identical results).
+if isdefined(Oceananigans.BoundaryConditions, :halo_condition_locality)
+    Oceananigans.BoundaryConditions.halo_condition_locality(::NumericalEarth.NestedModels.Interpolated) =
+        Oceananigans.BoundaryConditions.LocalHalo()
+    Oceananigans.Fields.FUSED_HALO_FILLING[] = get(ENV, "AR_FUSED_HALOS", "1") == "1"
+end
+
 ## AR_BACKEND=gpu compiles for the GPU (the cluster case); "cpu" keeps everything host-side, which
 ## is what makes this script runnable on a laptop.
 # ## `AR_ARCH=cuda`: the same model with Reactant taken out of the loop
