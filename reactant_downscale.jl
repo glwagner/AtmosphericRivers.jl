@@ -136,6 +136,12 @@ using CloudMicrophysics          # nested_atmosphere_model's default 1-moment mi
 using RRTMGP                     # Breeze's radiative-transfer extension
 using Reactant
 using CUDA                       # Reactant needs CUDA.jl loaded to raise KA kernels — on ANY backend
+## `AR_KERNEL_TUNING=1` / `AR_KERNEL_BLOCKS_PER_SM` / `AR_KERNEL_MAXREGS`: per-kernel register caps (launch bounds)
+## for the eager CUDA path — see perf/kernel_tuning.jl. Must load before the first kernel compiles.
+if any(k -> get(ENV, k, "") ∉ ("", "0"), ("AR_KERNEL_TUNING", "AR_KERNEL_BLOCKS_PER_SM", "AR_KERNEL_MAXREGS")) &&
+   !isdefined(Main, :tuned_launch_kwargs)
+    include(joinpath(@__DIR__, "perf", "kernel_tuning.jl"))
+end
 using Printf
 using Dates: DateTime, Hour   # `Hour` builds the ERA5 parent's 3-level hourly window
 import Dates                 # `Dates.format` for ERA5 file stamps
@@ -357,6 +363,15 @@ if get(ENV, "AR_PATCH_SROA_INSTCOMBINE", "0") == "1"
 end
 
 breeze_extension = Base.get_extension(NumericalEarth, :NumericalEarthBreezeExt)
+
+## `AR_FT_FORCING=1` also builds the atmosphere–ocean similarity-theory parameters at the atmosphere's own
+## float type: NumericalEarth hard-codes `AtmosphereThermodynamicsParameters(Float64)` for a Breeze
+## atmosphere, which makes the coupled-flux kernel (`compute_atmosphere_ocean_interface_state`) ~2400
+## f64 instructions long. Upstream fix: `AtmosphereThermodynamicsParameters(eltype(atmos.grid))`.
+if get(ENV, "AR_FT_FORCING", "0") == "1"
+    @eval NumericalEarth.EarthSystemModels.thermodynamics_parameters(atmos::Breeze.AtmosphereModel) =
+        NumericalEarth.Atmospheres.AtmosphereThermodynamicsParameters(eltype(atmos.grid))
+end
 
 ## 1. Move Breeze's terrain-following vertical coordinate onto Reactant. `on_architecture` for a
 ##    `LatitudeLongitudeGrid` walks the grid's fields through the extension's private `_to_reactant`,
@@ -808,7 +823,13 @@ end
 #
 # Upstream fix: either branch of this shim, applied at both sites.
 
-fts_union_fix = parse(Int, get(ENV, "AR_FTS_UNION_FIX", "1"))
+## `AR_FT_FORCING=1` keeps the nest's forcing parameters at the grid's float type: the FTS time weight is
+## narrowed (shim-11 mode 2 unless `AR_FTS_UNION_FIX` is set), and the Davies `relaxation_rate`, the lid
+## sponge's `damping_rate` and the `UpperSponge` rate become `Float32`. With the defaults these are `Float64`
+## and every forced tendency kernel (ρθ, ρu, ρv, ρqᵉ, ρw) and every open-boundary halo fill does its
+## time interpolation and relaxation in f64 (perf/PROFILE_REPORT.md item 16; agent OPT-KERNEL).
+ft_forcing = get(ENV, "AR_FT_FORCING", "0") == "1"
+fts_union_fix = parse(Int, get(ENV, "AR_FTS_UNION_FIX", ft_forcing ? "2" : "1"))
 
 if fts_union_fix != 0
     const OceanOutputReaders = Oceananigans.OutputReaders
@@ -1769,8 +1790,10 @@ relax_width = parse(Int, get(ENV, "AR_RELAX_WIDTH", "5"))
 ## `AR_RELAX_TIMESCALE` (seconds, default 300) sets the Davies relaxation rate 1/τ at the frame.
 ## `off` drops the interior relaxation forcing altogether (`relaxation_rate = nothing`) — not a physical
 ## configuration: it exists to measure what the in-kernel Davies forcing costs (perf/PROFILE_REPORT.md).
+forcing_FT = ft_forcing ? eltype(grid) : Float64
 relax_rate = get(ENV, "AR_RELAX_TIMESCALE", "300") == "off" ? nothing :
-             1 / parse(Float64, get(ENV, "AR_RELAX_TIMESCALE", "300"))
+             forcing_FT(1 / parse(Float64, get(ENV, "AR_RELAX_TIMESCALE", "300")))
+lid_damping_rate = forcing_FT(1 / 5)   # nested_atmosphere_model's default, at the forcing float type
 aiva = get(ENV, "AR_AIVA", "0") == "1"
 
 # ### The traced clock
@@ -2070,7 +2093,7 @@ acoustic_substeps = haskey(ENV, "AR_ACOUSTIC_SUBSTEPS") ? parse(Int, ENV["AR_ACO
 ## propagating waves off the top. Fine for inspecting what a step emits, wrong for a science run.
 damping_depth = breeze_extension.default_lid_depth(host_grid)
 sponge = get(ENV, "AR_SPONGE", "1") == "1" ?
-    UpperSponge(damping_rate = 1/5, depth = damping_depth) : nothing
+    UpperSponge(damping_rate = lid_damping_rate, depth = damping_depth) : nothing
 
 ## `AR_DIVERGENCE_DAMPING=α` (> 0) turns on Breeze's Klemp–Skamarock–Ha acoustic divergence damping
 ## (`ThermalDivergenceDamping`, Breeze's own default at α = 0.1; explicit bound α ≤ 0.25) in place of
@@ -2234,6 +2257,7 @@ else
     Reactant.@allowscalar nested_atmosphere_model(parent_atmosphere, grid;
                                                      terrain = nothing,
                                                      relaxation_rate = relax_rate,
+                                                     damping_rate = lid_damping_rate,
                                                      relaxation_width = relax_width,
                                                      base_pressure = p_std,
                                                      clock = model_clock,
@@ -2486,6 +2510,7 @@ elseif ic_mode === :interpolated
         cpu_nest = nested_atmosphere_model(cpu_parent, host_grid;
                                            terrain = nothing,
                                            relaxation_rate = relax_rate,
+                                           damping_rate = lid_damping_rate,
                                            relaxation_width = relax_width,
                                            base_pressure = p_std,
                                            clock = Clock(time = zero(FT)),
