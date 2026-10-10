@@ -1841,7 +1841,7 @@ if closure_kind == "tke"
     tke_max = parse(Float64, get(ENV, "AR_TKE_MAX", "1e4"))
     tke_time_discretization = aiva ? (; time_discretization = implicit_vertical) : (;)
     scalar_advection = merge(scalar_advection,
-                             (ρe = WENO(order = 5, bounds = (0, tke_max); tke_time_discretization...),))
+                             (ρe = WENO(order = 5, bounds = (zero(tke_max), tke_max); tke_time_discretization...),))
 end
 stage("scalar advection: " * join(("$(name) => $(summary(scheme))" for (name, scheme) in pairs(scalar_advection)), ", "))
 
