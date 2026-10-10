@@ -1,0 +1,44 @@
+#!/bin/bash
+#SBATCH --job-name=ar-parent
+#SBATCH --partition=gpua100,gpua100largex4,gpuprod,gpuprodflex
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=80G
+#SBATCH --time=04:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# One arm of the parent comparison: the 24 h 12 km real-terrain case (TKE closure, column pressure for
+# the hand-rolled parent, real sun, ERA5 SST, coupled) with the parent from AR_PARENT_KIND —
+# handrolled | native | boundary (NumericalEarth #750). Runs in AR_PARENT_PROJECT, a project that
+# develops a NumericalEarth carrying #750, with a private first depot.
+#
+#   sbatch --export=ALL,AR_PARENT_KIND=boundary slurm/parent_compare.batch
+#   sbatch --export=ALL,AR_PARENT_KIND=boundary,AR_DT=30,AR_RUN_HOURS=2 slurm/parent_compare.batch
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="${AR_DEPOT:-$HOME/.julia-parent}:$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_CPU_TARGET="generic;haswell,clone_all"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-6}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-6}
+export HDF5_USE_FILE_LOCKING=FALSE
+JULIA=~/.juliaup/bin/julia
+PROJECT=${AR_PARENT_PROJECT:-$HOME/AtmosphericRivers-parent/env}
+nvidia-smi --query-gpu=name --format=csv
+
+DT=${AR_DT:-10}
+HOURS=${AR_RUN_HOURS:-24}
+KIND=${AR_PARENT_KIND:-handrolled}
+export AR_ARCH=cuda AR_DOMAIN=landfall AR_CELLS_PER_DEGREE=9 AR_PARENT_KIND=$KIND
+export AR_PARENT=era5 AR_PARENT_HOURS=$(( HOURS + 1 )) AR_ERA5_REGION=-170.5,-109.5,24.5,60.5
+export AR_PARENT_UNIFORM_Z=1 AR_PARENT_PRESSURE=${AR_PARENT_PRESSURE:-column} AR_IC=interpolated AR_BALANCER=0
+export AR_COUPLED=1 AR_FLUX_ITERATIONS=10 AR_RADIATION=1 AR_RADIATION_EVERY=$(( 3600 / DT ))
+export AR_SOLAR=apparent AR_SST=${AR_SST:-era5}
+export AR_TERRAIN=etopo AR_TERRAIN_SMOOTHING=${AR_TERRAIN_SMOOTHING:-2}
+export AR_DT=$DT AR_STEPS=$(( HOURS * 3600 / DT )) AR_CHUNK=$(( 1800 / DT )) AR_SPONGE=1
+export AR_CLOSURE=${AR_CLOSURE:-tke} AR_TKE_FLAVOR=${AR_TKE_FLAVOR:-main}
+export AR_OUTPUT=1 AR_OUTPUT_FILE=runs/parent/landfall_9cpd_${HOURS}h_dt${DT}_${KIND}${AR_TAG:+_$AR_TAG}.jld2
+env | grep '^AR_' | sort
+echo "=== [$(date -Is)] project $PROJECT ==="
+stdbuf -oL -eL $JULIA --startup-file=no --project=$PROJECT -t auto reactant_downscale.jl
+status=$?
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status

@@ -200,7 +200,18 @@ const VANILLA = get(ENV, "AR_ARCH", "reactant") == "cuda"
 #
 # This method also OWNS the initial condition (`initialize_nested_child!` runs inside it), so the
 # `AR_IC` branch below is skipped — `AR_BALANCER` still selects whether the DFI balance runs.
-const NATIVE_PARENT = get(ENV, "AR_NATIVE_PARENT", "0") == "1"
+#
+# `AR_PARENT_KIND` picks the parent explicitly (default `handrolled`, the one built below):
+#   * `native`   — NumericalEarth's full-domain `PrescribedAtmosphere` over the padded child box;
+#   * `boundary` — NumericalEarth #750's `BoundaryPrescribedAtmosphere`: the parent held only on four
+#                  strips covering the boundary and relaxation zone, the Davies relaxation launched over
+#                  those strips only, and the IC interpolated from a two-date full-domain snapshot.
+# Both use ERA5's true per-column geopotential levels over `AR_PARENT_HOURS + 1` hourly dates.
+# `AR_NATIVE_PARENT=1` remains a synonym for `AR_PARENT_KIND=native`.
+const PARENT_KIND = Symbol(get(ENV, "AR_PARENT_KIND", get(ENV, "AR_NATIVE_PARENT", "0") == "1" ? "native" : "handrolled"))
+PARENT_KIND in (:handrolled, :native, :boundary) ||
+    error("AR_PARENT_KIND must be handrolled, native or boundary, got $(PARENT_KIND)")
+const NATIVE_PARENT = PARENT_KIND !== :handrolled
 
 ## Skipped under AR_ARCH=cuda: this initializes an XLA GPU client, which reserves device memory that
 ## CUDA.jl would then be competing with for no reason — nothing is compiled through XLA in that mode.
@@ -481,11 +492,18 @@ end
 ## 4. `time_step!(::NestedModel, Δt)` advances the parent by `Δt_parent = child.clock.time -
 ##    parent.clock.time` only `if Δt_parent > 0` — a traced comparison. A compiled run steps at a
 ##    fixed Δt, so parent and child clocks advance in lockstep and the guard is known to hold.
-const ReactantNestedModel = NestedModel{<:Any, <:Any, <:Any, <:Any, <:Any, <:ReactantState}
+##    NumericalEarth #750 added a `child_callbacks` field (and type parameter) to `NestedModel` — the
+##    boundary-strip relaxation runs through it — so the architecture is the 7th parameter there and
+##    the 6th before; the callbacks must be passed on as the upstream method does.
+const ReactantNestedModel = hasfield(NestedModel, :child_callbacks) ?
+    NestedModel{<:Any, <:Any, <:Any, <:Any, <:Any, <:Any, <:ReactantState} :
+    NestedModel{<:Any, <:Any, <:Any, <:Any, <:Any, <:ReactantState}
 
-function Oceananigans.TimeSteppers.time_step!(nest::ReactantNestedModel, Δt; kw...)
+nested_child_callbacks(nest) = hasfield(typeof(nest), :child_callbacks) ? nest.child_callbacks : ()
+
+function Oceananigans.TimeSteppers.time_step!(nest::ReactantNestedModel, Δt; callbacks = (), kw...)
     NumericalEarth.NestedModels.exchange_state!(nest.exchanger, nest.clock.time + Δt)
-    time_step!(nest.child, Δt; kw...)
+    time_step!(nest.child, Δt; callbacks = (callbacks..., nested_child_callbacks(nest)...), kw...)
     time_step!(nest.parent, Δt)
     return nothing
 end
@@ -1012,6 +1030,34 @@ host_grid = LatitudeLongitudeGrid(CPU();
 flat_terrain = get(ENV, "AR_FLAT_TERRAIN", "0") == "1"
 materialize_terrain!(host_grid, flat_terrain ? ((λ, φ) -> zero(λ)) : terrain_elevation)
 flat_terrain && @info "AR_FLAT_TERRAIN=1: orography zeroed (diagnostic; not a physical downscale)"
+
+# A native parent knows its own surface elevation, so the child's ground is the UNTAPERED orography
+# blended toward the parent's over the frame — what `nested_atmosphere_model(…; terrain)` does — rather
+# than tapered to zero as for the flat hand-rolled parent. Done here, on the host twin, before the grid
+# moves to the device, so the eager CUDA and the Reactant paths get identical terrain. The parent's
+# surface elevation comes from a two-date full-domain snapshot (the box the native parent reads).
+## The native parents read ERA5 through `download(::MetadataSet)`, whose method lives in the
+## CopernicusClimateDataStore extension (cached files make no requests; see the ERA5 block below).
+NATIVE_PARENT && get(ENV, "AR_LOAD_CDS", "1") == "1" && @eval import CopernicusClimateDataStore
+
+if NATIVE_PARENT && !flat_terrain
+    let ext = Base.get_extension(NumericalEarth, :NumericalEarthBreezeExt),
+        padding = parse(Float64, get(ENV, "AR_NATIVE_PADDING", "0.5")),
+        snapshot = PrescribedAtmosphere(BoundingBox(host_grid; padding), start_date:Hour(1):(start_date + Hour(1)),
+                                        ERA5HourlyPressureLevels(); architecture = CPU(), dir = era5_datadir),
+        elevation = Field{Center, Center, Nothing}(host_grid),
+        blend_width = ext.default_terrain_blend_width(host_grid, terrain_blend_length)
+
+        set!(elevation, (λ, φ) -> orography(λ, φ))
+        ## NumericalEarth #750 takes the parent's surface elevation; earlier versions the parent itself.
+        surface = isdefined(NumericalEarth.Atmospheres, :BoundaryPrescribedAtmosphere) ?
+                  NumericalEarth.surface_elevation(snapshot) : snapshot
+        ## `orography` is ETOPO already smoothed by AR_TERRAIN_SMOOTHING; don't smooth it twice.
+        smoothing = terrain_source == "etopo" ? 0 : parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2"))
+        ext.materialize_nested_terrain!(host_grid, elevation, surface, blend_width, smoothing)
+        @info @sprintf("native parent: child terrain blended toward the ERA5 surface over %d cells", blend_width)
+    end
+end
 
 # `AR_TERRAIN_PATCH=<file.jld2>`: write the terrain into an existing snapshot file and exit.
 #
@@ -2044,51 +2090,123 @@ dynamics = CompressibleDynamics(nested_time_discretization; base_pressure = p_st
 ## construction, so paying a device round-trip per element is nothing; the point of the guard (do not
 ## silently iterate a large device array) is not in play. Scoped to this call so nothing else inherits
 ## the permission — and a scalar loop over an actual FIELD would show up as a stall, not a wrong answer.
-nest = if NATIVE_PARENT
-    VANILLA || error("AR_NATIVE_PARENT=1 requires AR_ARCH=cuda: the native constructor builds the \
-                      parent on `architecture(child_grid)`, and doing that on ReactantState is the \
-                      180 GB OOM (job 4749) this file's hand-rolled parent exists to avoid.")
-    stage("building the nest NATIVELY from the dataset (AR_NATIVE_PARENT=1) — ERA5 per-column \
-           geopotential heights, dataset-default padding, and the IC done by initialize_nested_child!")
-    ## Terrain: hand the blend an elevation FIELD, and give it the UNTAPERED orography.
-    ##
-    ## `materialize_nested_terrain!` takes "an elevation `Field`, or a topography dataset", so the
-    ## idealized range defined above can go through exactly the path `downscale.jl` uses for
-    ## `ETOPO2022()` — no ETOPO download needed (its scratchspace is empty on this cluster).
-    ##
-    ## Untapered on purpose. The `terrain_elevation` taper exists because the HAND-ROLLED parent is
-    ## flat and knows nothing about its own orography: `surface_elevation` returns `nothing` for a
-    ## plain `LatitudeLongitudeGrid`, so the child's ground had to be forced to zero at the walls by
-    ## hand. The native parent is a `PressureLevelGrid` and DOES know its surface elevation, so the
-    ## blend can match the child's ground to the orography the parent state was actually produced
-    ## with — which is the real requirement, and strictly better than flattening to zero.
-    ##
-    ## Getting this wrong is not cosmetic: job 6734 ran native-parent with `terrain = nothing`, so no
-    ## blend happened and the child kept ground tapered to zero underneath a parent with real
-    ## orography. The mismatch showed up as `ρv` reaching -418 (v ≈ -320 m/s), far worse than the
-    ## hand-rolled run's -94.
-    native_terrain = Field{Center, Center, Nothing}(grid)
-    set!(native_terrain, (λ, φ) -> orography(λ, φ))
+# The native parents (`AR_PARENT_KIND=native|boundary`) are built by `build_native_nest` for any child
+# grid: the device `grid` (GPU or ReactantState) and, under Reactant, the host twin `host_grid` too,
+# whose nest initializes the child (`initialize_nested_child!` cannot run on a Reactant grid; see the
+# CPU-twin IC below) and hands its state to the device. The terrain was already blended toward the
+# parent's surface elevation on `host_grid` above, so the nest gets `terrain = nothing`.
+#
+# The parent is built here rather than by `nested_atmosphere_model(grid, dataset; …)`, whose parent
+# type changed with NumericalEarth #750 (strips by default), so that `AR_PARENT_KIND` means the same
+# thing on either NumericalEarth.
+native_dates = start_date:Hour(1):(start_date + Hour(parent_hours))
+native_padding = parse(Float64, get(ENV, "AR_NATIVE_PADDING",
+                                    string(NumericalEarth.DataWrangling.default_horizontal_padding(dataset))))
 
-    nested_atmosphere_model(grid, dataset;
-                            dates = start_date:Hour(1):(start_date + Hour(2)),
-                            dir = era5_datadir,
-                            terrain = native_terrain,
-                            terrain_blend_length,
-                            terrain_smoothing_passes = parse(Int, get(ENV, "AR_TERRAIN_SMOOTHING", "2")),
-                            relaxation_rate = relax_rate,
-                            relaxation_width = relax_width,
-                            ## Passed explicitly so the anchor matches `dynamics` below, which was
-                            ## built with it — otherwise this method derives its own from the
-                            ## dataset's domain-mean surface pressure and the two disagree.
-                            base_pressure = p_std,
-                            clock = model_clock,
-                            dynamics,
-                            microphysics,
-                            closure,
-                            momentum_advection,
-                            scalar_advection,
-                            balancer = get(ENV, "AR_BALANCER", "0") == "1")
+function crop_boundary_strip_files(child_grid)
+    ## Strip regions are new file names; cut them out of the cached padded child box
+    ## (`AR_STRIP_SOURCE_PADDING`, default 0.5° — the box `AR_PARENT_KIND=native` reads) instead of
+    ## queueing CDS requests. Same regions as `BoundaryPrescribedAtmosphere(grid, …)` builds.
+    box = BoundingBox(child_grid)
+    λw, λe = box.longitude
+    φs, φn = box.latitude
+    w = NumericalEarth.Atmospheres.relaxation_zone_width(child_grid, relax_width)
+    p = native_padding
+    λ = (λw - p, λe + p)
+    φ = (φs - p, φn + p)
+    regions = (BoundingBox(longitude = (λw - p, λw + w + p), latitude = φ),
+               BoundingBox(longitude = (λe - w - p, λe + p), latitude = φ),
+               BoundingBox(longitude = λ, latitude = (φs - p, φs + w + p)),
+               BoundingBox(longitude = λ, latitude = (φn - w - p, φn + p)))
+    source = BoundingBox(child_grid; padding = parse(Float64, get(ENV, "AR_STRIP_SOURCE_PADDING", "0.5")))
+    names = (:temperature, :eastward_velocity, :northward_velocity, :specific_humidity,
+             :specific_cloud_liquid_water_content, :specific_rain_water_content,
+             :specific_cloud_ice_water_content, :specific_snow_water_content, :geopotential)
+    sl = NumericalEarth.DataWrangling.matching_single_level_dataset(dataset)
+    made = crop_era5_regions!(regions, source, dataset, names,
+                              NumericalEarth.DataWrangling.expand_dates(dataset, :temperature, native_dates),
+                              era5_datadir; single_level = ((sl, :geopotential, start_date),))
+    stage("boundary strips: cropped $(made) ERA5 files from the cached $(source) box")
+    return nothing
+end
+
+if PARENT_KIND === :boundary
+    isdefined(NumericalEarth.Atmospheres, :BoundaryPrescribedAtmosphere) ||
+        error("AR_PARENT_KIND=boundary needs a NumericalEarth with BoundaryPrescribedAtmosphere (#750)")
+    include(joinpath(@__DIR__, "era5_crop.jl"))
+    crop_boundary_strip_files(host_grid)
+end
+
+# Returns `(nest, ic_prognostic_kw)`: the kwargs `initialize_nested_child!` needs for this nest's IC
+# (`prognostic` is a #750 keyword; a full parent's default is its own exchanger).
+function build_native_nest(child_grid, clock, dynamics)
+    arch = Oceananigans.Architectures.architecture(child_grid)
+    full_parent(dates) = PrescribedAtmosphere(BoundingBox(child_grid; padding = native_padding), dates, dataset;
+                                              architecture = arch, dir = era5_datadir)
+    native, snapshot = if PARENT_KIND === :boundary
+        strips = NumericalEarth.Atmospheres.BoundaryPrescribedAtmosphere(child_grid, native_dates, dataset;
+                                                                         width = relax_width, padding = native_padding,
+                                                                         dir = era5_datadir)
+        strips, full_parent(native_dates[1:2])
+    else
+        full = full_parent(native_dates)
+        full, full
+    end
+
+    kw = PARENT_KIND === :boundary ? (; parent_surface_elevation = NumericalEarth.surface_elevation(snapshot)) : (;)
+    nest = Reactant.@allowscalar nested_atmosphere_model(native, child_grid;
+                                                         terrain = nothing,
+                                                         relaxation_rate = relax_rate,
+                                                         relaxation_width = relax_width,
+                                                         ## The lid damping knob, where this script defines one.
+                                                         (@isdefined(lid_damping_rate) ? (; damping_rate = lid_damping_rate) : (;))...,
+                                                         ## Passed explicitly so the anchor matches `dynamics`.
+                                                         base_pressure = p_std,
+                                                         clock,
+                                                         dynamics,
+                                                         microphysics,
+                                                         closure,
+                                                         momentum_advection,
+                                                         scalar_advection,
+                                                         kw...)
+
+    ## The strips cannot supply an interior state: the IC comes from the full-domain snapshot through
+    ## an exchanger that matches the nest's own.
+    ic_kw = PARENT_KIND === :boundary ?
+        (; prognostic = breeze_extension.state_exchanger(snapshot, first(nest.exchanger)).prognostic) : (;)
+    return nest, ic_kw
+end
+
+nest = if NATIVE_PARENT
+    stage("building the nest with NumericalEarth's own ERA5 parent (AR_PARENT_KIND=$(PARENT_KIND)) — \
+           per-column geopotential levels, $(length(native_dates)) hourly dates, padding $(native_padding)°")
+    native_nest, native_ic_kw = build_native_nest(grid, model_clock, dynamics)
+    stage("$(PARENT_KIND) parent built: $(summary(native_nest.parent))")
+    native_balancer = get(ENV, "AR_BALANCER", "0") == "1"
+    if VANILLA
+        breeze_extension.initialize_nested_child!(native_nest, dataset, start_date, era5_datadir;
+                                                  balancer = native_balancer, native_ic_kw...)
+    else
+        ## Initialize a host twin of the same nest and copy its state to the device (as the hand-rolled
+        ## CPU-twin IC below does, minus its parent rebuild: here the twin builds its own native parent).
+        stage("native IC on a CPU twin (balancer $(native_balancer ? "on" : "off"))")
+        twin, twin_ic_kw = build_native_nest(host_grid, Clock(time = zero(FT)),
+                                             CompressibleDynamics(nested_time_discretization; base_pressure = p_std))
+        breeze_extension.initialize_nested_child!(twin, dataset, start_date, era5_datadir;
+                                                  balancer = native_balancer, twin_ic_kw...)
+        twin_prognostics = prognostic_fields(twin.child)
+        for (name, f) in pairs(prognostic_fields(native_nest.child))
+            copyto!(parent(f), Array(parent(twin_prognostics[name])))
+        end
+        if !isnothing(native_nest.child.dynamics.reference_state)
+            for fname in (:pressure, :density, :exner_function)
+                copyto!(parent(getfield(native_nest.child.dynamics.reference_state, fname)),
+                        Array(parent(getfield(twin.child.dynamics.reference_state, fname))))
+            end
+        end
+        stage("native IC: copied the twin's initialized state and reference to the device")
+    end
+    native_nest
 else
     Reactant.@allowscalar nested_atmosphere_model(parent_atmosphere, grid;
                                                      terrain = nothing,
@@ -3107,6 +3225,7 @@ function write_grid_metadata(path)
                              "ERA5 hourly pressure-level data read from disk." :
                              "the script's ANALYTIC atmospheric river, not ERA5 data.")
         file["meta/parent"]            = get(ENV, "AR_PARENT", "analytic")
+        file["meta/parent_kind"]       = string(PARENT_KIND)
         file["meta/start_date"]        = string(start_date)
     end
     return nothing
