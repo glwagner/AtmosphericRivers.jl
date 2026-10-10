@@ -23,7 +23,9 @@
 #   sbatch --export=ALL,AR_AD_STEPS=360:8640,AR_PARENT_HOURS=25 slurm/reactant_sensitivity.batch
 cd "$SLURM_SUBMIT_DIR"
 
-export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
+# AR_JULIA_DEPOT_PATH / AR_PROJECT select another environment, e.g. Breeze #975:
+#   AR_PROJECT=$HOME/AtmosphericRivers-975/env-975 AR_JULIA_DEPOT_PATH=$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia
+export JULIA_DEPOT_PATH="${AR_JULIA_DEPOT_PATH:-$HOME/.julia-prod:$HOME/.julia}"
 export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
 export HDF5_USE_FILE_LOCKING=FALSE
@@ -61,6 +63,8 @@ AR_AD_CONTROL=${AR_AD_CONTROL:-moisture} \
 AR_AD_STEPS=${AR_AD_STEPS:-360:2160:4320:8640} \
 AR_AD_ACCUM_START=${AR_AD_ACCUM_START:-0} \
 AR_AD_CHECKPOINTS=${AR_AD_CHECKPOINTS:-4} \
+AR_CLOSURE=${AR_CLOSURE:-tke} \
+AR_TKE_FLAVOR=${AR_TKE_FLAVOR:-main} \
 AR_BACKEND=gpu \
 AR_DOMAIN=${AR_DOMAIN:-landfall} \
 AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-3} \
@@ -76,7 +80,7 @@ AR_SPONGE=${AR_SPONGE:-1} \
 AR_DT=$DT \
 AR_OUTPUT=1 \
 AR_OUTPUT_FILE=${AR_OUTPUT_FILE:-runs/sensitivity/snapshots_${SLURM_JOB_ID}.jld2} \
-    stdbuf -oL -eL $JULIA --startup-file=no --project=. -t auto reactant_downscale.jl
+    stdbuf -oL -eL $JULIA --startup-file=no --project=${AR_PROJECT:-.} -t auto reactant_downscale.jl
 status=$?
 
 echo "=== [$(date -Is)] done (exit $status) ==="
