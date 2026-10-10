@@ -1794,9 +1794,24 @@ stage("microphysics: $(summary(microphysics))")
 closure_kind = get(ENV, "AR_CLOSURE", "tke")
 closure_kind in ("tke", "none") || error("AR_CLOSURE must be tke or none, got $(closure_kind)")
 
-build_closure(FT) = TKEBasedTurbulenceClosure(Oceananigans.TurbulenceClosures.VerticallyImplicitTimeDiscretization(), FT;
-                                              mixing_length = Breeze.TKEMixingLength(),
-                                              stability_functions = Breeze.ConstantStabilityFunctions())
+## `AR_TKE_FLAVOR` picks the closure's parameters:
+##   `main`    (default) `TKEMixingLength` + `ConstantStabilityFunctions`, Breeze main's API;
+##   `default` whatever this Breeze's constructor defaults to — on Breeze #975 that is
+##             `GradientLimitedMixingLength` + `ConstantStabilityFunctions` + `MoistStaticStability`;
+##   `catke`   Breeze #975's `catke_parameters()`: `GradientLimitedMixingLength(Cˢ = 1.131)` +
+##             `RiDependentStabilityFunctions` (CATKE's calibrated values).
+## #975 removes `TKEMixingLength`, so `main` only resolves on a Breeze without #975, and `catke` only
+## on one with it; the names are looked up when `build_closure` runs, not when the script parses.
+tke_flavor = get(ENV, "AR_TKE_FLAVOR", "main")
+tke_flavor in ("main", "default", "catke") || error("AR_TKE_FLAVOR must be main, default or catke, got $(tke_flavor)")
+
+function build_closure(FT)
+    td = Oceananigans.TurbulenceClosures.VerticallyImplicitTimeDiscretization()
+    tke_flavor == "default" && return TKEBasedTurbulenceClosure(td, FT)
+    tke_flavor == "catke" && return TKEBasedTurbulenceClosure(td, FT; Breeze.catke_parameters()...)
+    return TKEBasedTurbulenceClosure(td, FT; mixing_length = Breeze.TKEMixingLength(),
+                                             stability_functions = Breeze.ConstantStabilityFunctions())
+end
 
 closure = closure_kind == "tke" ? build_closure(FT) : nothing
 initial_tke = parse(FT, get(ENV, "AR_TKE_INITIAL", "1e-3"))
@@ -2934,6 +2949,7 @@ host_number(x) = x isa Reactant.ConcreteRNumber ? Reactant.to_number(x) : x
 const JLD2 = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "JLD2")
 
 write_output = get(ENV, "AR_OUTPUT", "1") == "1"
+output_closure_fields = get(ENV, "AR_OUTPUT_CLOSURE", "0") == "1"
 output_path = get(ENV, "AR_OUTPUT_FILE",
                   "reactant_$(get(ENV, "AR_DOMAIN", "corridor"))_$(ic_mode)$(get(ENV, "AR_BALANCER", "0") == "1" ? "_balanced" : "").jld2")
 
@@ -3019,6 +3035,15 @@ function write_snapshot(path, model, iteration, t)
             file["timeseries/precipitation_flux/$iteration"] = Array(host_interior(precipitation_flux))[:, :, 1]
             file["timeseries/accumulated_precipitation/$iteration"] =
                 Array(host_interior(accumulated_precipitation))[:, :, 1]
+        end
+        ## `AR_OUTPUT_CLOSURE=1`: the closure's diagnosed diffusivities (and, on Breeze #975, the
+        ## stored N² and mixing length), at (Center, Center, Face) — whatever `closure_fields` carries.
+        if output_closure_fields
+            cf = breeze_child(model).closure_fields
+            for name in (:Kᵘ, :Kᶜ, :ℓ, :N²)
+                hasproperty(cf, name) || continue
+                file["timeseries/closure_$(name)/$iteration"] = Array(host_interior(getproperty(cf, name)))
+            end
         end
         ## No separate iteration index: it would have to be deleted and rewritten on every
         ## snapshot, and a run killed mid-rewrite would leave the file inconsistent with its own
@@ -3127,6 +3152,7 @@ report(model, 0.0)
 
 if write_output
     write_grid_metadata(output_path)
+    JLD2.jldopen(write_physical_heights, output_path, "a+")
     write_snapshot(output_path, model, host_number(model.clock.iteration), host_number(model.clock.time))
     stage("writing snapshots to $(output_path)")
 end
