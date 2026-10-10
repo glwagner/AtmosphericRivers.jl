@@ -3082,12 +3082,12 @@ else
     (;)
 end
 
-ar_compile_options(; raise, raise_first = false, optimize = true, kwargs...) =
+ar_compile_options(; raise, raise_first = false, optimize = true, xla_debug_options = XLA_DEBUG_OPTIONS, kwargs...) =
     Reactant.CompileOptions(; optimization_passes = optimize,
                             raise, raise_first,
                             sync = true,
                             speculate_partial_ifs = true,
-                            xla_debug_options = XLA_DEBUG_OPTIONS,
+                            xla_debug_options,
                             kwargs...)
 
 ## `@code_hlo` defaults `shardy_passes`/`strip` to `:none` itself, but those defaults are dropped the
@@ -4035,8 +4035,14 @@ if get(ENV, "AR_AD", "0") == "1"
     AIVA_HOST_DT[] = Δt
     stage("AD: compiling the reverse sweep (raise_first = $(AD_RAISE_FIRST)) — ONE compile for every window")
     compile_start = time_ns()
+    ## `AR_AD_DETECT_NAN=1`: XLA checks every thunk of the REVERSE executable for NaN and logs the
+    ## offending HLO instruction (warning mode). Only this compile — the same pass breaks the eager
+    ## kernel compiles ("Module output slices must not contain tuple shapes", job 2611).
+    ad_debug_options = get(ENV, "AR_AD_DETECT_NAN", "0") == "1" ?
+        merge(XLA_DEBUG_OPTIONS, (; xla_gpu_detect_nan = Reactant.Proto.xla.var"DebugOptions.DetectionMode".DETECTION_MODE_WARNING)) :
+        XLA_DEBUG_OPTIONS
     r_ad_gradient! = @compile compile_options = ar_compile_options(
-        raise = raise_option, raise_first = AD_RAISE_FIRST) ad_gradient!(
+        raise = raise_option, raise_first = AD_RAISE_FIRST, xla_debug_options = ad_debug_options) ad_gradient!(
         model, dmodel, control, dcontrol, ad_aux, ad_daux, Δt, ad_steps)
     ad_compile_seconds = 1e-9 * (time_ns() - compile_start)
     stage(@sprintf("AD: compiled the reverse sweep in %.1f s", ad_compile_seconds))
