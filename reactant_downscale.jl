@@ -3672,10 +3672,50 @@ if get(ENV, "AR_AD", "0") == "1"
     ## weights comes back as ∂J/∂w = the accumulated precipitation itself.
     const AD_LOSS = get(ENV, "AR_AD_LOSS", "meansquare")
     const PRECIPITATION_LOSS = AD_LOSS in ("precip", "precipitation")
-    PRECIPITATION_LOSS || AD_LOSS == "meansquare" ||
-        error("AR_AD_LOSS=$(AD_LOSS): use `meansquare` or `precipitation`")
+    const COASTAL_FLUX_LOSS = AD_LOSS == "coastal_flux"
+    PRECIPITATION_LOSS || COASTAL_FLUX_LOSS || AD_LOSS == "meansquare" ||
+        error("AR_AD_LOSS=$(AD_LOSS): use `meansquare`, `precipitation` or `coastal_flux`")
 
-    ad_aux = if PRECIPITATION_LOSS
+    ## ### `AR_AD_LOSS=coastal_flux`: eastward moisture flux through a meridional plane off the coast
+    ##
+    ## J = time-mean, segment-mean vertically integrated eastward moisture flux (kg m⁻¹ s⁻¹, an IVT-like
+    ## number) through the u-face column nearest `AR_AD_PLANE_LON` (default −124.3°), over
+    ## `AR_AD_PLANE_LAT` (default 44.5–47.0°N), surface to model top:
+    ##
+    ##     J = (1 / N_acc) Σₙ Σⱼₖ Wⱼₖ ρuᵢ₀ⱼₖ ½(ρqᵉ/ρᵈ|ᵢ₀₋₁ + ρqᵉ/ρᵈ|ᵢ₀),   Wⱼₖ = A^x_{i₀jk} / Σⱼ Δy_{i₀j}
+    ##
+    ## with A^x the terrain-following face area (Δy·Δz). ρu is dry-density-weighted (ρᵈu) in Breeze, so
+    ## ρu·ρqᵉ/ρᵈ = u·ρqᵉ. Moisture is the PROGNOSTIC ρqᵉ — total non-precipitating water (vapour + cloud)
+    ## under the saturation-adjustment scheme — so the loss itself never differentiates through saturation
+    ## adjustment; the dynamics still does. Accumulated over steps n > AR_AD_ACCUM_START.
+    function coastal_plane_aux()
+        plane_λ = parse(Float64, get(ENV, "AR_AD_PLANE_LON", "-124.3"))
+        φ₁ᵖ, φ₂ᵖ = parse.(Float64, split(get(ENV, "AR_AD_PLANE_LAT", "44.5:47.0"), [',', ':']))
+        λf = Array(λnodes(host_grid, Face(), Center(), Center()))
+        φc = Array(φnodes(host_grid, Center(), Center(), Center()))
+        i₀ = argmin(abs.(λf .- plane_λ))
+        2 ≤ i₀ ≤ length(λf) - 1 || error("coastal_flux plane at $(plane_λ)° is on the domain wall")
+        band = findall(φ -> φ₁ᵖ ≤ φ ≤ φ₂ᵖ, φc)
+        Nxh, Nyh, Nzh = size(host_grid)
+        L = sum(Oceananigans.Operators.Δyᶠᶜᶜ(i₀, j, 1, host_grid) for j in band)
+        W = zeros(FT, Nyh, Nzh)
+        for j in band, k in 1:Nzh
+            W[j, k] = Oceananigans.Operators.Axᶠᶜᶜ(i₀, j, k, host_grid) / L
+        end
+        stage(@sprintf("AD: coastal_flux plane at u-face i₀ = %d (λ = %.3f°), %d rows %.2f–%.2f°N, segment %.0f km",
+                       i₀, λf[i₀], length(band), φc[first(band)], φc[last(band)], L / 1e3))
+        ## Host-only description of the plane, for the output file; kept out of the traced argument.
+        global COASTAL_PLANE_META = (λ = λf[i₀], i = i₀, φ_band = (φc[first(band)], φc[last(band)]),
+                                     rows = band, segment_m = L)
+        return (; plane_weights = Reactant.to_rarray(W),
+                  plane_acc = Reactant.to_rarray(zeros(FT, Nyh, Nzh)),
+                  start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))),
+                  plane_i = Val(i₀))
+    end
+
+    ad_aux = if COASTAL_FLUX_LOSS
+        coastal_plane_aux()
+    elseif PRECIPITATION_LOSS
         loss_file = get(ENV, "AR_AD_LOSS_FILE", joinpath(@__DIR__, "sensitivity", "loss.jl"))
         include(loss_file)
         λc = Array(λnodes(host_grid, Center(), Center(), Center()))
@@ -3799,7 +3839,28 @@ if get(ENV, "AR_AD", "0") == "1"
 
     scheduled_Δt(aux, n, Δt) = haskey(aux, :dts) ? aux.dts[min(n, length(aux.dts))] : Δt
 
-    function ad_loss(model, control, aux::NamedTuple, Δt, nsteps)
+    @inline function plane_flux(child, ::Val{i₀}) where i₀
+        fields = prognostic_fields(child)
+        ρu = view(interior(fields.ρu), i₀, :, :)
+        q₋ = view(interior(fields[AD_CONTROL]), i₀ - 1, :, :) ./ view(interior(fields.ρᵈ), i₀ - 1, :, :)
+        q₊ = view(interior(fields[AD_CONTROL]), i₀, :, :) ./ view(interior(fields.ρᵈ), i₀, :, :)
+        return ρu .* (q₋ .+ q₊) ./ 2
+    end
+
+    function ad_loss(model, control, aux::NamedTuple{K}, Δt, nsteps) where K
+        :plane_weights in K || return precipitation_loss(model, control, aux, Δt, nsteps)
+        child = breeze_child(model)
+        interior(prognostic_fields(child)[AD_CONTROL]) .= interior(control)
+        acc = aux.plane_acc
+        acc .= 0
+        @trace mincut = true checkpointing = ad_checkpointing() track_numbers = false for n = 1:nsteps
+            time_step!(model, Δt)
+            acc .+= ifelse(n > aux.start, one(Δt), zero(Δt)) .* plane_flux(child, aux.plane_i)
+        end
+        return sum(aux.plane_weights .* acc) / (nsteps - aux.start)
+    end
+
+    function precipitation_loss(model, control, aux::NamedTuple, Δt, nsteps)
         child = breeze_child(model)
         interior(prognostic_fields(child)[AD_CONTROL]) .= interior(control)
         acc = interior(aux.accumulated)
@@ -4170,6 +4231,17 @@ if get(ENV, "AR_AD", "0") == "1"
                 file["ad/dt"]              = Float64(Δt)
                 file["ad/control_value"]   = Array(host_interior(control))
                 write_physical_heights(file)
+                if COASTAL_FLUX_LOSS
+                    m = COASTAL_PLANE_META
+                    file["ad/plane_lambda"]   = m.λ
+                    file["ad/plane_i"]        = m.i
+                    file["ad/plane_phi_band"] = collect(m.φ_band)
+                    file["ad/plane_rows"]     = collect(m.rows)
+                    file["ad/plane_segment_m"] = m.segment_m
+                    file["ad/plane_weights"]  = Array(ad_aux.plane_weights)
+                    file["ad/accum_start"]    = host_number(ad_aux.start)
+                    file["ad/loss_units"]     = "kg m^-1 s^-1: time-mean, segment-mean ∫ u ρqᵉ dz through the plane (ρqᵉ = vapour + cloud)"
+                end
                 if PRECIPITATION_LOSS
                     file["ad/weights"]              = Array(host_interior(ad_aux.weights))[:, :, 1]
                     file["ad/precip_accumulated"]   = Array(host_interior(ad_aux.accumulated))[:, :, 1]
