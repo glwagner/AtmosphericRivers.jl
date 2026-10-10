@@ -13,14 +13,14 @@
 #     J = Σ w · ∫ bottom_precipitation_flux dt     (weights from sensitivity/loss.jl)
 #     ∂J/∂ρqᵉ at the state one step after the ERA5 initial condition
 #
-# AR_AD_STEPS is a comma list of window lengths: ONE compile serves all of them (traced trip count).
+# AR_AD_STEPS is a COLON list (sbatch --export splits on commas) of window lengths: ONE compile serves all of them (traced trip count).
 # AR_PARENT_HOURS must cover the longest window (shim 2b holds the whole parent axis resident).
 #
 # Host memory is deliberately generous: the reverse sweep's first execution was SIGKILLed by the
 # host OOM killer at 28 GB on the old cluster (REACTANT_AD_REPORT.md §5.4).
 #
 #   sbatch slurm/reactant_sensitivity.batch                                    # defaults below
-#   sbatch --export=ALL,AR_AD_STEPS=720,AR_PARENT_HOURS=3 slurm/reactant_sensitivity.batch
+#   sbatch --export=ALL,AR_AD_STEPS=360:8640,AR_PARENT_HOURS=25 slurm/reactant_sensitivity.batch
 cd "$SLURM_SUBMIT_DIR"
 
 export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
@@ -58,7 +58,7 @@ AR_AD=1 \
 AR_AD_LOSS=${AR_AD_LOSS:-precipitation} \
 AR_AD_LOSS_FILE=${AR_AD_LOSS_FILE:-sensitivity/loss.jl} \
 AR_AD_CONTROL=${AR_AD_CONTROL:-moisture} \
-AR_AD_STEPS=${AR_AD_STEPS:-128,256,512,720} \
+AR_AD_STEPS=${AR_AD_STEPS:-360:2160:4320:8640} \
 AR_AD_ACCUM_START=${AR_AD_ACCUM_START:-0} \
 AR_AD_CHECKPOINTS=${AR_AD_CHECKPOINTS:-4} \
 AR_BACKEND=gpu \

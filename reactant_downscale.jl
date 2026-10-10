@@ -3204,7 +3204,8 @@ if get(ENV, "AR_AD", "0") == "1"
     ## a FIXED checkpoint budget with recomputation scheduled to minimise the extra work around it.
     ## So memory is bounded by the budget no matter how long the window gets, and the cost of a longer
     ## window shows up as recomputation instead of as tape.
-    ad_step_list = [parse(Int, x) for x in split(get(ENV, "AR_AD_STEPS", "2"), ',') if !isempty(strip(x))]
+    ## Commas, colons or spaces: `sbatch --export` splits on commas, so batch submissions use colons.
+    ad_step_list = [parse(Int, x) for x in split(get(ENV, "AR_AD_STEPS", "2"), [',', ':', ' ']) if !isempty(strip(x))]
     smoke && (ad_step_list = [2])
     const AD_CHECKPOINT_BUDGET = parse(Int, get(ENV, "AR_AD_CHECKPOINTS", "4"))
     ## `AR_AD_RAISE_FIRST=0` re-tests whether the raise-before-Enzyme ordering is still required
@@ -3420,7 +3421,7 @@ if get(ENV, "AR_AD", "0") == "1"
         return dcontrol, loss_value
     end
 
-    stage("AD: ∂/∂$(AD_CONTROL) of mean($(AD_TARGET)²); windows $(join(ad_step_list, ", ")) steps, " *
+    stage("AD: ∂/∂$(AD_CONTROL) of $(PRECIPITATION_LOSS ? "weighted accumulated precipitation" : "mean($(AD_TARGET)²)"); windows $(join(ad_step_list, ", ")) steps, " *
           "$(AD_CHECKPOINT_BUDGET < 0 ? "automatic (true)" : AD_CHECKPOINT_BUDGET == 0 ? "no" : "Binomial($(AD_CHECKPOINT_BUDGET))") " *
           "checkpointing, $(ad_traced_steps ? "traced" : "static") trip count")
 
