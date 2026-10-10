@@ -37,7 +37,7 @@ STEPS=$(( RUN_HOURS * 3600 / ${AR_DT:-10} ))
 
 run_one () {
     local tag=$1 balancer=$2
-    echo "=== [$(date -Is)] run $tag: hydrostatic parent, ${RUN_HOURS} h of a ${HOURS} h parent, AR_BALANCER=$balancer, $STEPS steps ==="
+    echo "=== [$(date -Is)] run $tag: AR_PARENT_PRESSURE=${AR_PARENT_PRESSURE:-default}, ${RUN_HOURS} h of a ${HOURS} h parent, AR_BALANCER=$balancer, $STEPS steps ==="
     AR_ARCH=cuda \
     AR_DOMAIN=${AR_DOMAIN:-landfall} \
     AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-9} \

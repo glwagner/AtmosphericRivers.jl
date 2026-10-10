@@ -1,13 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=ar-analysis
 #SBATCH --partition=gpuprod
-#SBATCH --gpus=1
-#SBATCH --cpus-per-task=12
-#SBATCH --mem=100G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=60G
 #SBATCH --time=02:00:00
 #SBATCH --output=slurm/%x-%j.log
 
-# Run one analysis/ script on a compute node of the type the prod depot was precompiled on (the
+# Run one analysis/ script (no GPU needed) on a compute node of the type the prod depot was precompiled on (the
 # login node re-precompiles CairoMakie and contends for the depot's pidfile locks).
 #   sbatch slurm/analysis.batch analysis/<script>.jl args…
 cd "$SLURM_SUBMIT_DIR"
