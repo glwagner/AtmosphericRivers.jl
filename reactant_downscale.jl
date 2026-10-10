@@ -2006,6 +2006,37 @@ if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_FROZEN_K", "1") == "1" &&
     @info "shim 17: frozen-diffusivity adjoint (closure fields pass through ignore_derivatives)"
 end
 
+# ### Shim 18 (under `AR_AD_SAFE_MICROPHYSICS`): snow–rain accretion's √ without 0/0
+#
+# CloudMicrophysics' `accretion_snow_rain` forms Δv_eff = √((vᵢ − vⱼ)² + c(vᵢ² + vⱼ²)); both terminal
+# velocities are exactly 0 wherever either species is absent, so the radicand is 0 and the reverse pass
+# divides a zero adjoint by 2√0 = 0 → NaN, in every rain- or snow-free cell. Only the snow pathway
+# (env-micro's MP1M + snow) calls it, which is why that environment's adjoint went NaN within 3 h
+# (coastal_flux, no closure, job 2630) where Breeze main's stayed finite past 9 h. Floor the radicand.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_MICROPHYSICS", "1") == "1"
+    @eval CloudMicrophysics.Microphysics1M @inline function accretion_snow_rain(
+            type_i::CMP.PrecipitationType, type_j::CMP.PrecipitationType, blk1mveltype_ti, blk1mveltype_tj,
+            E_ij, coeff_disp, q_i, q_j, ρ, n0_i, n0_j, v0_i, v0_j, λ_i_inv, λ_j_inv)
+        (; r0, m0, me, Δm, χm, gamma_coeff) = type_j.mass
+        δ = me + Δm
+        v_ti = terminal_velocity(type_i, blk1mveltype_ti, ρ, q_i, v0_i, λ_i_inv)
+        v_tj = terminal_velocity(type_j, blk1mveltype_tj, ρ, q_j, v0_j, λ_j_inv)
+        radicand = (v_ti - v_tj)^2 + coeff_disp * (v_ti^2 + v_tj^2)
+        Δv_eff = sqrt(max(radicand, oftype(radicand, 1e-12)))
+        accr_rate =
+            π / ρ * n0_i * n0_j * m0 * χm * E_ij * Δv_eff * gamma_coeff /
+            r0^δ * (
+                2 * λ_i_inv^3 * λ_j_inv^(δ + 1) +
+                2 * (δ + 1) * λ_i_inv^2 * λ_j_inv^(δ + 2) +
+                (δ + 2) * (δ + 1) * λ_i_inv * λ_j_inv^(δ + 3)
+            )
+        ϵ = UT.ϵ_numerics(UT.promote_typeof(q_i, q_j))
+        cond = q_i > ϵ && q_j > ϵ
+        return ifelse(cond, accr_rate, zero(accr_rate))
+    end
+    @info "shim 18: AD-safe snow–rain accretion (√ radicand floored)"
+end
+
 # ### Shim 14 (`AR_AD_SAFE_TKE`, default on under `AR_AD=1`): no infinite derivatives in the TKE closure
 #
 # Breeze's TKE closure evaluates `√N²⁺` and `√|e|` where both can be exactly 0, and hides the result
