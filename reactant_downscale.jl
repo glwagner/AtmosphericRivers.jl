@@ -1776,6 +1776,11 @@ model_clock = traced_clock()
 # default has no snow source at all on Breeze main: `microphysical_tendency(::MP1M, Val(:ρqˢⁿ))` falls
 # through to zero (only the non-equilibrium variant defines ice → snow autoconversion, accretion,
 # deposition and melting), so cloud ice sits in ρqᵉ forever and only warm rain reaches the ground.
+# Breeze branch `ar/mixed-phase-positivity` (~/Breeze-micro; env ~/AtmosphericRivers-micro/env-micro) gives
+# the default scheme the same snow pathway and donor-limits every 1M process rate, which also makes the
+# non-equilibrium scheme stable at Δt = 10 s (it NaN'd within 20 min before): north-band 24 h precip
+# 6.9 → 12.1 mm, polygon 9.7 → 11.8 mm (figures/micro/). Without that Breeze this knob changes nothing
+# for snow under `equilibrium`.
 microphysics = if get(ENV, "AR_MICROPHYSICS", "equilibrium") == "nonequilibrium"
     cm_extension = Base.get_extension(Breeze, :BreezeCloudMicrophysicsExt)
     ## Any non-`nothing` ice entry is a phase indicator, materialized from the scheme's own parameters.
