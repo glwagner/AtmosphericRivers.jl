@@ -1,0 +1,23 @@
+#!/bin/bash
+#SBATCH --job-name=ar-portable-pc
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=100G
+#SBATCH --time=03:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Portable pkgimages (PROFILE_REPORT §9 #10): precompile a project into a depot that holds NO other
+# caches (~/.julia-opt-portable: symlinked packages/artifacts/registries/scratchspaces only), for the
+# multi-target JULIA_CPU_TARGET Julia's own x86_64 binaries use, then time loading it.
+#   sbatch -p gpua100largex4spot slurm/portable_precompile.batch
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH=${AR_PORTABLE_DEPOT:-$HOME/.julia-opt-portable}
+export JULIA_CPU_TARGET=${AR_CPU_TARGET:-"generic;sandybridge,-xsaveopt,clone_all;haswell,-rdrnd,base(1);x86-64-v4,-rdrnd,base(1)"}
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+JULIA=~/.juliaup/bin/julia
+PROJECT=${AR_E2E_PROJECT:-$HOME/AtmosphericRivers-opt-e2e/env}
+hostname; lscpu | grep "Model name"; echo "JULIA_CPU_TARGET=$JULIA_CPU_TARGET"
+t0=$(date +%s)
+$JULIA --startup-file=no --project=$PROJECT -e 'using Pkg; Pkg.precompile()' || exit 1
+t1=$(date +%s); echo "PRECOMPILE_SECONDS $((t1 - t0))"
+$JULIA --startup-file=no --project=$PROJECT perf/load_check.jl

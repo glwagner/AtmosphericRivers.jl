@@ -1,0 +1,20 @@
+#!/bin/bash
+#SBATCH --job-name=ar-reactant-terrain-probe
+#SBATCH --partition=gpuprod
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
+#SBATCH --time=02:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Build the 12 km nest on ReactantState with AR_TERRAIN (default etopo) and stop before the
+# compiles (AR_REPORT_ONLY=1): answers "does this terrain survive the move onto the Reactant grid
+# and give a finite initial state" without paying for an XLA compile.
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
+export HDF5_USE_FILE_LOCKING=FALSE
+AR_BACKEND=gpu AR_DOMAIN=landfall AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-9} \
+AR_PARENT=era5 AR_PARENT_UNIFORM_Z=1 AR_ERA5_REGION=-170.5,-109.5,24.5,60.5 AR_PARENT_HOURS=2 \
+AR_IC=interpolated AR_TERRAIN=${AR_TERRAIN:-etopo} AR_COUPLED=${AR_COUPLED:-1} AR_DT=${AR_DT:-10} \
+AR_REPORT_ONLY=1 AR_OUTPUT=0 \
+    stdbuf -oL -eL ~/.juliaup/bin/julia --startup-file=no --project=. -t auto reactant_downscale.jl

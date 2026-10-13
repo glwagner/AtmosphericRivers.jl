@@ -3443,6 +3443,8 @@ function write_snapshot(path, model, iteration, t)
     return nothing
 end
 
+include(joinpath(@__DIR__, "async_output.jl"))   # `AR_ASYNC_OUTPUT=1` (eager CUDA only)
+
 function report(model, wall_seconds)
     bounds = VANILLA ? prognostic_bounds(model) : @jit prognostic_bounds(model)
     iter = host_number(model.clock.iteration)
@@ -4381,8 +4383,27 @@ if haskey(ENV, "AR_BOUNDARY_PROBE")
     exit(0)
 end
 
-snapshot!(model) = write_output &&
-    write_snapshot(output_path, model, host_number(model.clock.iteration), host_number(model.clock.time))
+async_output = VANILLA && write_output && get(ENV, "AR_ASYNC_OUTPUT", "0") == "1"
+snapshot_writer = async_output ? AsyncSnapshotWriter(output_path, model) : nothing
+async_output && stage("AR_ASYNC_OUTPUT=1: snapshots staged into page-locked buffers and written on a background task")
+## `AR_ASYNC_OUTPUT_VERIFY=1`: also write every snapshot synchronously to a twin file, started from a
+## copy of the output file as it is now (grid metadata + the initial snapshot), so that
+## perf/compare_jld2.jl can check the asynchronous file against it from the SAME run.
+verify_path = async_output && get(ENV, "AR_ASYNC_OUTPUT_VERIFY", "0") == "1" ?
+    replace(output_path, r"\.jld2$" => "") * "_syncverify.jld2" : nothing
+isnothing(verify_path) || cp(output_path, verify_path; force = true)
+
+snapshot_seconds = Ref(0.0)   # time the stepping loop spends in `snapshot!`
+
+function snapshot!(model)
+    write_output || return false
+    start = time_ns()
+    iteration, t = host_number(model.clock.iteration), host_number(model.clock.time)
+    async_output ? async_snapshot!(snapshot_writer, iteration, t) : write_snapshot(output_path, model, iteration, t)
+    snapshot_seconds[] += 1e-9 * (time_ns() - start)
+    isnothing(verify_path) || write_snapshot(verify_path, model, iteration, t)
+    return true
+end
 
 # `AR_SPINUP_STEPS` steps at `AR_SPINUP_DT` (eager CUDA only), first step included, before the main
 # loop. The interpolated initial condition is out of balance and its first steps launch a violent
@@ -4484,6 +4505,7 @@ if adaptive_Δt
     end
 
     dt_log = step_adaptively!(model, Float64(spinup_steps > 0 ? Δt_spinup : Δt))
+    flush_snapshots!(snapshot_writer)   # nothing else may open the output file while a write is in flight
 
     if write_output
         JLD2.jldopen(output_path, "a+") do file
@@ -4516,6 +4538,15 @@ for n in 1:(adaptive_Δt ? 0 : chunks)
     snapshot!(model)
     ## A NaN never heals: stop rather than step (and write) garbage for the rest of the run.
     worst_nonfinite > 0 && break
+end
+
+write_output && stage(@sprintf("snapshot output: %.2f s on the stepping loop (%s)", snapshot_seconds[],
+                               async_output ? "AR_ASYNC_OUTPUT=1" : "synchronous"))
+if async_output
+    flush_start = time_ns()
+    flush_snapshots!(snapshot_writer)
+    stage(@sprintf("AR_ASYNC_OUTPUT: %d snapshots; %.2f s staging on the stepping loop, %.2f s waiting for the last writes",
+                   snapshot_writer.count, snapshot_writer.staged_seconds, 1e-9 * (time_ns() - flush_start)))
 end
 
 # One unambiguous verdict line, so the run answers "are there NaNs after stepping?" without anyone
