@@ -36,7 +36,7 @@ mkdir -p "$TMPDIR"
 # (REACTANT_AD_REPORT.md §4); AR_XLA_AUTOTUNE_LEVEL=0 turns autotuning off entirely.
 AUTOTUNE_CACHE="$SLURM_SUBMIT_DIR/xla_autotune_cache"
 mkdir -p "$AUTOTUNE_CACHE"
-XLA_EXTRA="--xla_gpu_per_fusion_autotune_cache_dir=$AUTOTUNE_CACHE"
+XLA_EXTRA="${XLA_EXTRA:-} --xla_gpu_per_fusion_autotune_cache_dir=$AUTOTUNE_CACHE"   # honour a caller XLA_EXTRA (e.g. --xla_gpu_enable_command_buffer=)
 [ -n "${AR_XLA_AUTOTUNE_LEVEL:-}" ] && XLA_EXTRA="$XLA_EXTRA --xla_gpu_autotune_level=$AR_XLA_AUTOTUNE_LEVEL"
 # H100-only hang workaround (§3.4); harmless elsewhere, so on by default.
 [ "${AR_XLA_NO_MOF:-1}" = "1" ] && XLA_EXTRA="$XLA_EXTRA --xla_disable_hlo_passes=multi_output_fusion"
