@@ -19,6 +19,7 @@ using Printf
 
 const JLD2 = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "JLD2")
 const NCDatasets = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "NCDatasets")
+include(joinpath(@__DIR__, "precip_colors.jl"))
 
 root = joinpath(@__DIR__, "..")
 run_path = ARGS[1]
@@ -81,29 +82,26 @@ title = @sprintf("24 h precipitation, %s → %s", Dates.format(window[1], "u d H
                  Dates.format(window[2], "u d HH:MM"))
 Label(fig[0, 1:2], title; fontsize = 20, font = :bold)
 
-colorrange = (0, 120)
-colormap = :YlGnBu
 λlims, φlims = (-131, -115), (40, 52)
 
 ax_model = Axis(fig[1, 1]; title = @sprintf("Breeze 12 km nest (max %.0f mm)", maximum(total)),
                 xlabel = "longitude (°E)", ylabel = "latitude (°N)", limits = (λlims, φlims), aspect = DataAspect())
-heatmap!(ax_model, λ, φ, total; colorrange, colormap, lowclip = :white, highclip = :black)
+precip_heatmap!(ax_model, λ, φ, total)
 contour!(ax_model, λ, φ, h; levels = [1000], color = (:gray30, 0.6), linewidth = 0.6)
 
 ax_era5 = Axis(fig[1, 2]; title = @sprintf("ERA5 0.25° (max %.0f mm)", maximum(filter(isfinite, era5_total))),
                xlabel = "longitude (°E)", limits = (λlims, φlims), aspect = DataAspect())
-hm = heatmap!(ax_era5, era5_λ, era5_φ[era5_order], era5_total[:, era5_order]; colorrange, colormap,
-              lowclip = :white, highclip = :black)
-Colorbar(fig[1, 3], hm; label = "mm per 24 h")
+precip_heatmap!(ax_era5, era5_λ, era5_φ[era5_order], era5_total[:, era5_order])
+precip_colorbar!(fig[1, 3]; label = "mm per 24 h")
 
 for ax in (ax_model, ax_era5)
-    lines!(ax, coastλ, coastφ; color = :black, linewidth = 0.8)
-    lines!(ax, box_λ, box_φ; color = :red, linewidth = 2)
+    geo_lines!(ax)
+    outline!(ax, box_λ, box_φ)
 end
 
 ax_series = Axis(fig[2, 1:2]; xlabel = "hours since " * Dates.format(window[1], "yyyy-mm-dd HH:MM"),
                  ylabel = "mm h⁻¹",
-                 title = @sprintf("target box mean (red): Breeze %.1f mm, ERA5 %.1f mm over the window",
+                 title = @sprintf("target box mean (outlined): Breeze %.1f mm, ERA5 %.1f mm over the window",
                                   target_mean(total), sum(era5_rate)))
 stairs!(ax_series, model_rate_hours, model_rate; step = :pre, color = :royalblue, linewidth = 2.5, label = "Breeze 12 km")
 stairs!(ax_series, 1:length(era5_rate), era5_rate; step = :pre, color = :black, linewidth = 2, label = "ERA5")

@@ -13,6 +13,7 @@ using Printf
 
 const JLD2 = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "JLD2")
 const NCDatasets = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "NCDatasets")
+include(joinpath(@__DIR__, "precip_colors.jl"))
 
 root = joinpath(@__DIR__, "..")
 out_path = ARGS[1]
@@ -57,10 +58,10 @@ lines_out = String[@sprintf("%-26s %9s %9s %8s %s", "run", "target mm", "north m
                              "interior max (≥10 cells from the walls): mm @ lon, lat, terrain m, slope")]
 function panel!(k, title, λ, φ, P)
     ax = Axis(fig[cld(k, ncol), mod1(k, ncol)]; title, limits = ((-131, -115), (40, 54)), aspect = DataAspect())
-    hm = heatmap!(ax, λ, φ, P; colorrange = (0, 120), colormap = :YlGnBu, highclip = :black)
-    lines!(ax, coastλ, coastφ; color = :black, linewidth = 0.7)
-    lines!(ax, rect(target_λ, target_φ)...; color = :red, linewidth = 1.5)
-    lines!(ax, rect(band_λ, band_φ)...; color = :orange, linewidth = 1.5, linestyle = :dash)
+    hm = precip_heatmap!(ax, λ, φ, P)
+    geo_lines!(ax)
+    outline!(ax, rect(target_λ, target_φ)...)
+    outline!(ax, rect(band_λ, band_φ)...; linewidth = 1.4, linestyle = :dash)
     return hm
 end
 for (k, (label, path)) in enumerate(runs)
@@ -80,8 +81,8 @@ target = mean_in(era5, eλ, eφ, target_λ, target_φ)
 north = mean_in(era5, eλ, eφ, band_λ, band_φ)
 push!(lines_out, @sprintf("%-26s %9.1f %9.1f %8.0f", "ERA5 (0.25°)", target, north, maximum(filter(isfinite, era5))))
 hm = panel!(panels, @sprintf("ERA5: target %.1f, north %.1f mm", target, north), eλ, eφ, era5)
-Colorbar(fig[1, ncol + 1], hm; label = "mm, Dec 7 12Z → Dec 8 12Z")
-Label(fig[0, 1:ncol], "24 h precipitation; red = SW WA/NW OR target (land), orange dashed = northern coast band";
+precip_colorbar!(fig[1:cld(panels, ncol), ncol + 1]; label = "mm, Dec 7 12Z → Dec 8 12Z")
+Label(fig[0, 1:ncol], "24 h precipitation; solid box = SW WA/NW OR target (land), dashed = northern coast band";
       fontsize = 17, font = :bold)
 save(out_path, fig)
 foreach(println, lines_out)

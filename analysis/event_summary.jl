@@ -21,6 +21,7 @@ using Printf
 const JLD2 = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "JLD2")
 const NCDatasets = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "NCDatasets")
 include(joinpath(@__DIR__, "..", "sensitivity", "region.jl"))   # TARGET_POLYGON, point_in_polygon
+include(joinpath(@__DIR__, "precip_colors.jl"))
 
 root = joinpath(@__DIR__, "..")
 run_path = ARGS[1]
@@ -81,9 +82,9 @@ coastλ, coastφ = natural_earth_lines("coastline")
 poly_λ = [first.(TARGET_POLYGON); first(TARGET_POLYGON)[1]]
 poly_φ = [last.(TARGET_POLYGON); first(TARGET_POLYGON)[2]]
 band_rect = ([band_λ[1], band_λ[2], band_λ[2], band_λ[1], band_λ[1]], [band_φ[1], band_φ[1], band_φ[2], band_φ[2], band_φ[1]])
-decorate!(ax) = (lines!(ax, coastλ, coastφ; color = :black, linewidth = 0.7);
-                 lines!(ax, poly_λ, poly_φ; color = :red, linewidth = 1.5);
-                 lines!(ax, band_rect...; color = :orange, linewidth = 1.2, linestyle = :dash))
+decorate!(ax) = (geo_lines!(ax);
+                 outline!(ax, poly_λ, poly_φ);
+                 outline!(ax, band_rect...; linewidth = 1.2, linestyle = :dash))
 summary_lines = String[]
 
 # ## IVT at matched leads
@@ -121,7 +122,7 @@ era5_hourly_target = [masked_mean(p, eT) for p in era5_hourly]
 era5_hourly_band = [masked_mean(p, eB) for p in era5_hourly]
 
 fig = Figure(size = (1500, 560length(windows) + 500), fontsize = 13)
-Label(fig[0, 1:2], "Accumulated precipitation (mm) — red: target polygon, orange: northern band"; font = :bold)
+Label(fig[0, 1:2], "Accumulated precipitation (mm) — solid: target polygon, dashed: northern band"; font = :bold)
 for (r, W) in enumerate(windows)
     P = accumulated(snapshot(W)) .- accumulated(snapshot(0))
     E = sum(era5_hourly[1:W])
@@ -130,9 +131,9 @@ for (r, W) in enumerate(windows)
                                   maximum(P[11:end-10, 11:end-10])))
     for (c, (lo, la, x, who)) in enumerate(((λ, φ, P, "Breeze 12 km"), (eλ, eφ, E, "ERA5")))
         ax = Axis(fig[r, c]; title = @sprintf("%s, 0–%d h", who, W), limits = ((-131, -115), (40, 54)), aspect = DataAspect())
-        hm = heatmap!(ax, lo, la, x; colorrange = (0, 50W / 24), colormap = :YlGnBu, highclip = :black)
+        precip_heatmap!(ax, lo, la, x)
         decorate!(ax)
-        c == 2 && Colorbar(fig[r, 3], hm)
+        c == 2 && precip_colorbar!(fig[r, 3]; label = "mm, 0–$W h")
     end
 end
 r = length(windows) + 1

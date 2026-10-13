@@ -23,6 +23,7 @@ const NCDatasets = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "N
 
 root = joinpath(@__DIR__, "..")
 include(joinpath(root, "sensitivity", "region.jl"))
+include(joinpath(@__DIR__, "precip_colors.jl"))
 
 out_path = ARGS[1]
 runs_spec = [split(a, "="; limit = 2) for a in ARGS[2:end]]
@@ -143,22 +144,22 @@ for (c, r) in enumerate(runs)
     total = r.P[end] .- r.P[1]
     ax = Axis(fig[1, c]; title = @sprintf("%s\nregion %.1f mm, max %.0f mm", r.label, regional(total), maximum(total)),
               limits = (λlims, φlims), aspect = DataAspect())
-    global hm = heatmap!(ax, r.λc, r.φc, total; colorrange = (0, 120), colormap = :YlGnBu, highclip = :black)
+    precip_heatmap!(ax, r.λc, r.φc, total)
     contour!(ax, r.λc, r.φc, r.h; levels = [1000], color = (:gray30, 0.6), linewidth = 0.6)
-    lines!(ax, coastλ, coastφ; color = :black, linewidth = 0.7)
-    lines!(ax, poly_λ, poly_φ; color = :red, linewidth = 2)
+    geo_lines!(ax)
+    outline!(ax, poly_λ, poly_φ)
 
     axi = Axis(fig[2, c]; title = @sprintf("IVT at +%.0f h (max %.0f)", r.t[end] / 3600, maximum(r.IVT)),
                limits = ((-148, -112), (38, 56)), aspect = DataAspect())
     heatmap!(axi, r.λc, r.φc, r.IVT; colorrange = (0, 1200), colormap = :viridis)
-    lines!(axi, coastλ, coastφ; color = :white, linewidth = 0.6)
+    geo_lines!(axi; color = :white, coast_width = 0.9, state_width = 0.5)
 end
 axe = Axis(fig[1, n+1]; title = @sprintf("ERA5 0.25°\nregion %.1f mm, max %.0f mm", sum(era5_rate), maximum(filter(isfinite, era5_total))),
            limits = (λlims, φlims), aspect = DataAspect())
-heatmap!(axe, era5_λ, era5_φ[era5_order], era5_total[:, era5_order]; colorrange = (0, 120), colormap = :YlGnBu, highclip = :black)
-lines!(axe, coastλ, coastφ; color = :black, linewidth = 0.7)
-lines!(axe, poly_λ, poly_φ; color = :red, linewidth = 2)
-Colorbar(fig[1, n+2], hm; label = "mm per 24 h")
+precip_heatmap!(axe, era5_λ, era5_φ[era5_order], era5_total[:, era5_order])
+geo_lines!(axe)
+outline!(axe, poly_λ, poly_φ)
+precip_colorbar!(fig[1, n+2]; label = "mm per 24 h")
 
 colors = Makie.wong_colors()
 axs = Axis(fig[3, 1:n+1]; xlabel = "hours since " * Dates.format(window[1], "yyyy-mm-dd HH:MM"), ylabel = "mm h⁻¹",

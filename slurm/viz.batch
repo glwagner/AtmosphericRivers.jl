@@ -1,0 +1,23 @@
+#!/bin/bash
+#SBATCH --job-name=ar-viz
+#SBATCH --partition=gpua100largex4spot,gpua100largex4,gpuprod
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=04:00:00
+#SBATCH --output=slurm/%x-%j.log
+# CPU-only figure/animation rendering (no --gres: takes no GPU). Evaluates each line of the command file $1,
+# with $J = `julia --project=.` (e.g. `AR_ANIM_FPS=12 $J analysis/animate_forward.jl out.mp4 a=run.jld2`). Compiled caches go to ~/.julia-viz, so the shared ~/.julia-prod is only read.
+#   sbatch slurm/viz.batch commands.txt
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-viz:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_NUM_PRECOMPILE_TASKS=8
+export HDF5_USE_FILE_LOCKING=FALSE
+J="$HOME/.juliaup/bin/julia --startup-file=no --project=."
+status=0
+while read -r line; do
+  [[ -z "$line" || "$line" == \#* ]] && continue
+  echo "=== [$(date -Is)] $line"
+  eval "$line" < /dev/null || status=$?
+done < "$1"
+echo "=== [$(date -Is)] done (status $status)"
+exit $status

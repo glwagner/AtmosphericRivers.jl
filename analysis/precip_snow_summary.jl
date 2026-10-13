@@ -1,8 +1,13 @@
 # 24 h precipitation summary for mixed-phase runs: polygon-mean (sensitivity/region.jl, area-weighted),
 # the northern band (46–54°N, 131–122°W), the snow share of the surface flux, and a map figure.
 #
-# Usage: julia --project=<env with JLD2 + CairoMakie> analysis/precip_snow_summary.jl out.png label=run.jld2 …
-using JLD2, CairoMakie, Printf
+# Usage: julia --project=.. analysis/precip_snow_summary.jl out.png label=run.jld2 …
+using Oceananigans, NumericalEarth      # bring JLD2 into the loaded set; NumericalEarth + NaturalEarth → coastlines
+using CairoMakie, Printf
+using NaturalEarth, GeoInterface
+const JLD2 = first(m for (pkg, m) in Base.loaded_modules if pkg.name == "JLD2")
+const jldopen = JLD2.jldopen
+include(joinpath(@__DIR__, "precip_colors.jl"))
 include(joinpath(@__DIR__, "..", "sensitivity", "region.jl"))
 
 out = ARGS[1]
@@ -31,9 +36,10 @@ for (k, (label, path)) in enumerate(runs)
     @printf("%-28s polygon %.2f mm  north %.2f mm  max %.0f mm  max ρqˢⁿ(24h) %.2e\n", label, r.target, r.north, r.pmax, r.snowmax)
     ax = Axis(fig[1, k]; title = @sprintf("%s\npolygon %.1f, north %.1f mm", label, r.target, r.north),
               limits = ((-131, -116), (40, 54)), aspect = DataAspect())
-    heatmap!(ax, r.λc, r.φc, r.P; colormap = :YlGnBu, colorrange = (0, 80))
+    precip_heatmap!(ax, r.λc, r.φc, r.P)
+    geo_lines!(ax)
     ring = vcat(TARGET_POLYGON, TARGET_POLYGON[1:1])
-    lines!(ax, first.(ring), last.(ring); color = :red)
+    outline!(ax, first.(ring), last.(ring))
 end
-Colorbar(fig[1, length(runs) + 1]; colormap = :YlGnBu, limits = (0, 80), label = "mm / 24 h")
+precip_colorbar!(fig[1, length(runs) + 1]; label = "mm / 24 h")
 save(out, fig)
