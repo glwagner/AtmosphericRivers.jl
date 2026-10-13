@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH --job-name=ar-kaudit
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=80G
+#SBATCH --time=02:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Per-kernel audit of the production forward step (perf/kernel_audit.jl), agent OPT-KERNEL.
+# AR_AUDIT_TAG names the outputs; AR_AUDIT_PROJECT the Julia project (default: the OPT-KERNEL env, a copy
+# of ~/AtmosphericRivers-perf/env-975-prs with cloned Oceananigans/Breeze). Launch bounds come from
+# AR_KERNEL_BLOCKS_PER_SM / AR_KERNEL_MAXREGS (perf/kernel_tuning.jl). Private first depot.
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="${AR_AUDIT_DEPOT:-$HOME/.julia-opt-kernel}:$HOME/.julia-perf:$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-6}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-6}
+export HDF5_USE_FILE_LOCKING=FALSE
+JULIA=~/.juliaup/bin/julia
+PROJECT=${AR_AUDIT_PROJECT:-$HOME/AtmosphericRivers-opt-kernel/env}
+GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | awk '{print $2}')
+nvidia-smi --query-gpu=name,clocks.max.sm,clocks.max.mem --format=csv
+
+DT=${AR_DT:-10}
+export AR_ARCH=cuda AR_DOMAIN=landfall AR_CELLS_PER_DEGREE=9
+export AR_PARENT=era5 AR_PARENT_HOURS=${AR_PARENT_HOURS:-2} AR_ERA5_REGION=-170.5,-109.5,24.5,60.5
+export AR_PARENT_UNIFORM_Z=1 AR_PARENT_PRESSURE=${AR_PARENT_PRESSURE:-column} AR_IC=interpolated AR_BALANCER=0
+export AR_COUPLED=1 AR_FLUX_ITERATIONS=10 AR_RADIATION=1 AR_RADIATION_EVERY=$(( 3600 / DT ))
+export AR_SOLAR=apparent AR_SST=${AR_SST:-era5}
+export AR_TERRAIN=etopo AR_TERRAIN_SMOOTHING=${AR_TERRAIN_SMOOTHING:-2}
+export AR_DT=$DT AR_STEPS=2 AR_CHUNK=2 AR_SPONGE=1 AR_OUTPUT=0
+export AR_CLOSURE=${AR_CLOSURE:-tke} AR_TKE_FLAVOR=${AR_TKE_FLAVOR:-default}
+TAG=${AR_AUDIT_TAG:-base}_$GPU
+env | grep '^AR_' | sort
+echo "=== [$(date -Is)] project $PROJECT, tag $TAG, host $(hostname) ==="
+
+if [ "${AR_AUDIT_INSTANTIATE:-0}" = "1" ]; then
+    $JULIA --startup-file=no --project=$PROJECT -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' || exit 1
+    echo "=== [$(date -Is)] instantiated ==="
+fi
+
+mkdir -p perf/data
+AR_AUDIT_OUT=perf/data/kaudit_$TAG stdbuf -oL -eL $JULIA --startup-file=no --project=$PROJECT -t auto perf/kernel_audit.jl
+status=$?
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status

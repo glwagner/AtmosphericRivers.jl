@@ -1,0 +1,19 @@
+#!/bin/bash
+#SBATCH --job-name=ar-optcol-btest
+#SBATCH --gpus=1
+#SBATCH --time=04:00:00
+#SBATCH --output=slurm/%x-%j.log
+# Breeze tests that exercise the batched implicit solves, fused TKE kernel and fused limiters (OPT-COLUMN).
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-opt-column:$HOME/.julia-perf:$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-8}
+export BREEZE_TEST_FLOAT32=false
+JULIA=~/.juliaup/bin/julia
+ENV=$HOME/AtmosphericRivers-opt-column/env
+nvidia-smi --query-gpu=name --format=csv,noheader
+$JULIA --startup-file=no --project=$ENV -e 'using Pkg; Pkg.precompile()' || exit 1
+for t in ${OPT_TESTS:-tke_closure turbulence_closures vertical_diffusion implicit_vertical_advection advection_schemes cloud_microphysics_1M terrain_following_split_explicit}; do
+  echo "=== [$(date -Is)] test $t ==="
+  $JULIA --startup-file=no --project=$ENV -e "include(joinpath(homedir(), \"opt-column\", \"Breeze\", \"test\", \"$t.jl\"))" 2>&1 | grep -vE "^\s+@ |^\s+\[[0-9]+\]" | tail -40
+  echo "=== test $t exit ${PIPESTATUS[0]} ==="
+done

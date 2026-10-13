@@ -6,3 +6,14 @@ runs/
 slurm/*.log
 sysimage_a100.so*
 renderenv/
+
+# profiling outputs (regenerate with slurm/perf_window.batch)
+perf/data/
+perf/nsys/
+
+# Run debris
+logs/
+reactant_dumps/
+*_dt.csv
+*_summary.txt
+runs/

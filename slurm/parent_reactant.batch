@@ -1,0 +1,58 @@
+#!/bin/bash
+#SBATCH --job-name=ar-parent-rx
+#SBATCH --partition=gpuprod,gpuprodflex,gpua100,gpua100largex4,gpua100largex4spot
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
+#SBATCH --time=08:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# NumericalEarth's own ERA5 parent (AR_PARENT_KIND=native|boundary) on ReactantState: compile and run a
+# short primal (AR_AD_PRIMAL_ONLY=1) or a short precipitation gradient (AR_AD_PRIMAL_ONLY=0), at 3 cpd.
+#
+#   sbatch --export=ALL,AR_PARENT_KIND=native slurm/parent_reactant.batch
+#   sbatch --export=ALL,AR_PARENT_KIND=native,AR_AD_PRIMAL_ONLY=0,AR_AD_STEPS=360 slurm/parent_reactant.batch
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="${AR_DEPOT:-$HOME/.julia-parent}:$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_CPU_TARGET="generic;haswell,clone_all"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
+export HDF5_USE_FILE_LOCKING=FALSE
+export TMPDIR="$SLURM_SUBMIT_DIR/reactant_dumps"; mkdir -p "$TMPDIR"
+AUTOTUNE_CACHE="$SLURM_SUBMIT_DIR/xla_autotune_cache"; mkdir -p "$AUTOTUNE_CACHE"
+export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_per_fusion_autotune_cache_dir=$AUTOTUNE_CACHE --xla_disable_hlo_passes=multi_output_fusion"
+PROJECT=${AR_PARENT_PROJECT:-$HOME/AtmosphericRivers-parent/env}
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; nproc; free -g | head -2
+
+KIND=${AR_PARENT_KIND:-native}
+AR_PARENT_KIND=$KIND \
+AR_AD=1 \
+AR_AD_PRIMAL_ONLY=${AR_AD_PRIMAL_ONLY:-1} \
+AR_AD_LOSS=${AR_AD_LOSS:-precipitation} \
+AR_AD_LOSS_FILE=${AR_AD_LOSS_FILE:-sensitivity/loss.jl} \
+AR_AD_CONTROL=${AR_AD_CONTROL:-moisture} \
+AR_AD_STEPS=${AR_AD_STEPS:-36} \
+AR_AD_ACCUM_START=0 \
+AR_AD_CHECKPOINTS=${AR_AD_CHECKPOINTS:-4} \
+AR_BACKEND=gpu \
+AR_DOMAIN=landfall \
+AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-3} \
+AR_PARENT=era5 \
+AR_ERA5_REGION=-170.5,-109.5,24.5,60.5 \
+AR_PARENT_HOURS=${AR_PARENT_HOURS:-2} \
+AR_PARENT_UNIFORM_Z=1 \
+AR_PARENT_PRESSURE=column \
+AR_IC=interpolated \
+AR_BALANCER=0 \
+AR_COUPLED=0 \
+AR_RADIATION=0 \
+AR_SPONGE=1 \
+AR_CLOSURE=${AR_CLOSURE:-none} \
+AR_TERRAIN=etopo \
+AR_DT=${AR_DT:-10} \
+AR_OUTPUT=0 \
+AR_AD_FILE=${AR_AD_FILE:-runs/parent/ad_${KIND}_${SLURM_JOB_ID}.jld2} \
+    stdbuf -oL -eL ~/.juliaup/bin/julia --startup-file=no --project=$PROJECT -t auto reactant_downscale.jl
+status=$?
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status

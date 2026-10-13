@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --job-name=ar-optcol-test
+#SBATCH --gpus=1
+#SBATCH --time=02:00:00
+#SBATCH --output=slurm/%x-%j.log
+# perf/test_multi_tridiagonal.jl on CPU and GPU, in the OPT-COLUMN test environment.
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-opt-column:$HOME/.julia-perf:$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia"
+JULIA=~/.juliaup/bin/julia
+P=${OPT_TEST_PROJECT:-$HOME/AtmosphericRivers-opt-column/testenv}
+nvidia-smi --query-gpu=name --format=csv,noheader
+$JULIA --startup-file=no --project=$P -e 'using Pkg; Pkg.precompile()' || exit 1
+[ "${OPT_TEST_SKIP_CPU:-0}" = "1" ] || $JULIA --startup-file=no --project=$P perf/test_multi_tridiagonal.jl
+$JULIA --startup-file=no --project=$P perf/test_multi_tridiagonal.jl gpu
+echo "=== done ==="

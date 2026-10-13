@@ -1,0 +1,58 @@
+#!/bin/bash
+#SBATCH --job-name=ar-perf
+#SBATCH --partition=gpuprod
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
+#SBATCH --time=02:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# Profile the 12 km eager-CUDA forward step (perf/profile_forward.jl). AR_PROF_NSYS=1 wraps the run
+# in nsys with a cudaProfilerApi capture range; otherwise CUDA.jl's integrated profiler prints tables.
+cd "$SLURM_SUBMIT_DIR"
+
+## Private first depot: anything this job (re)compiles — PR branches, or native code for another host CPU —
+## lands in ~/.julia-perf and never evicts the shared ~/.julia-prod caches.
+export JULIA_DEPOT_PATH="$HOME/.julia-perf:$HOME/.julia-prod:$HOME/.julia"
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
+export HDF5_USE_FILE_LOCKING=FALSE
+JULIA=~/.juliaup/bin/julia
+PROJECT=${AR_PERF_PROJECT:-.}
+nvidia-smi --query-gpu=name,clocks.max.sm,clocks.max.mem --format=csv
+
+DT=${AR_DT:-10}
+export AR_ARCH=cuda AR_DOMAIN=${AR_DOMAIN:-landfall} AR_CELLS_PER_DEGREE=${AR_CELLS_PER_DEGREE:-9}
+export AR_PARENT=era5 AR_PARENT_HOURS=${AR_PARENT_HOURS:-6}
+export AR_ERA5_REGION=${AR_ERA5_REGION:--170.5,-109.5,24.5,60.5}
+export AR_PARENT_UNIFORM_Z=1 AR_IC=interpolated AR_BALANCER=0
+export AR_COUPLED=${AR_COUPLED:-1} AR_FLUX_ITERATIONS=${AR_FLUX_ITERATIONS:-10}
+export AR_RADIATION=${AR_RADIATION:-1} AR_RADIATION_EVERY=${AR_RADIATION_EVERY:-$(( 3600 / DT ))}
+export AR_SOLAR_COS_ZENITH=0 AR_DT=$DT AR_STEPS=${AR_STEPS:-10} AR_CHUNK=${AR_CHUNK:-10}
+export AR_SPONGE=1 AR_OUTPUT=0 AR_TERRAIN=${AR_TERRAIN:-etopo} AR_TERRAIN_SMOOTHING=${AR_TERRAIN_SMOOTHING:-2}
+export AR_SPINUP_STEPS=${AR_SPINUP_STEPS:-0} AR_SPINUP_DT=${AR_SPINUP_DT:-10}
+env | grep '^AR_' | sort
+
+# AR_PERF_VARIANTS: space-separated `tag:project:fmuladd_fix:host_profile` entries run one after another
+# in this allocation, e.g. "base:.:1:1 fma:.:0:0 prs:$HOME/AtmosphericRivers-perf/env-pr:0:0".
+VARIANTS=${AR_PERF_VARIANTS:-base:${AR_PERF_PROJECT:-.}:1:0}
+for v in $VARIANTS; do
+    IFS=: read -r tag project fmuladd host <<< "$v"
+    echo "=== [$(date -Is)] variant $tag: project=$project AR_FMULADD_FIX=$fmuladd AR_PROF_HOST=$host ==="
+    if [ "$project" != "." ]; then
+        ## A private first depot, so precompiling the PR branches never evicts the shared env's caches.
+        export JULIA_DEPOT_PATH="$HOME/.julia-perf:$HOME/.julia-prod:$HOME/.julia"
+        $JULIA --startup-file=no --project=$project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' || continue
+    fi
+    CMD="$JULIA --startup-file=no --project=$project -t auto perf/profile_forward.jl"
+    if [ "${AR_PROF_NSYS:-0}" = "1" ]; then
+        mkdir -p perf/nsys
+        out=perf/nsys/ar-perf-$SLURM_JOB_ID-$tag
+        AR_FMULADD_FIX=$fmuladd AR_PROF_HOST=$host \
+        nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop --trace=cuda,nvtx,osrt \
+            --sample=none --cpuctxsw=none -o $out --force-overwrite=true stdbuf -oL -eL $CMD
+        nsys stats --report cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum --format csv -o $out $out.nsys-rep
+    else
+        AR_FMULADD_FIX=$fmuladd AR_PROF_HOST=$host stdbuf -oL -eL $CMD
+    fi
+done
+echo "=== done (exit $?) ==="

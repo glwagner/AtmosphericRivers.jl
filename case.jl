@@ -23,6 +23,14 @@ domain_presets = (corridor = ((-170, -110), (25, 60)),
                   landfall = ((-148, -112), (38, 56)))
 longitude, latitude = domain_presets[Symbol(get(ENV, "AR_DOMAIN", "corridor"))]
 
+# `AR_DOMAIN_BOX="λ₁:λ₂:φ₁:φ₂"` (or commas) overrides the preset with an arbitrary box (degrees), e.g. a reduced
+# nest around the coastal-flux plane so a 6 km reverse sweep fits on one 80 GB GPU.
+if haskey(ENV, "AR_DOMAIN_BOX")
+    let b = parse.(Float64, split(ENV["AR_DOMAIN_BOX"], [',', ':']))  # colons survive sbatch --export
+        global longitude, latitude = (b[1], b[2]), (b[3], b[4])
+    end
+end
+
 # The northern corridor edge cuts through the steep BC-coast terrain that seeds the
 # frame cold-point instability at (-129.7, 59.8); AR_LAT_NORTH trims it out (the AR
 # landfalls all sit south of 56).

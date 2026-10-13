@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=ar-cuda-hydro-ab
-#SBATCH --partition=gpu-prod
+#SBATCH --partition=gpuprod
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=200G
 #SBATCH --time=06:00:00
 #SBATCH --output=slurm/%x-%j.log
@@ -25,8 +25,8 @@ cd "$SLURM_SUBMIT_DIR"
 export JULIA_DEPOT_PATH="$HOME/.julia-prod:$HOME/.julia"
 mkdir -p "$HOME/.julia-prod"
 
-export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-16}
-export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
 export HDF5_USE_FILE_LOCKING=FALSE   # NFS: HDF5 POSIX locks misbehave
 export TMPDIR="$SLURM_SUBMIT_DIR/reactant_dumps"
 mkdir -p "$TMPDIR"

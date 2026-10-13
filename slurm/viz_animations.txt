@@ -1,0 +1,11 @@
+# Forward-run animations (analysis/animate_forward.jl), one frame per snapshot.
+AR_ANIM_PREVIEW=figures/animations/event72h_column_tke_last.png $J analysis/animate_forward.jl figures/animations/event72h_column_tke.mp4 "72 h, column parent, TKE, real sun=reactant_landfall_era5_9cpd_cuda_hydro_72h_dt10_etopo_s2_column_sun_tke_nobal.jld2"
+AR_ANIM_PREVIEW=figures/animations/closure975_precip_rate_last.png $J analysis/animate_forward.jl figures/animations/closure975_precip_rate.mp4 "no closure=runs/closure975/landfall_9cpd_24h_dt10_none.jld2" "Breeze main TKE=runs/closure975/landfall_9cpd_24h_dt10_main_rhoeweno.jld2" "#975 default=runs/closure975/landfall_9cpd_24h_dt10_pr975default_rhoeweno.jld2" "#975 CATKE params=runs/closure975/landfall_9cpd_24h_dt10_pr975catke_rhoeweno.jld2"
+$J analysis/animate_forward.jl figures/animations/closure975_none.mp4 "no closure=runs/closure975/landfall_9cpd_24h_dt10_none.jld2"
+$J analysis/animate_forward.jl figures/animations/closure975_main_tke.mp4 "Breeze main TKE=runs/closure975/landfall_9cpd_24h_dt10_main_rhoeweno.jld2"
+$J analysis/animate_forward.jl figures/animations/closure975_pr975default.mp4 "#975 default TKE=runs/closure975/landfall_9cpd_24h_dt10_pr975default_rhoeweno.jld2"
+$J analysis/animate_forward.jl figures/animations/closure975_pr975catke.mp4 "#975 CATKE params=runs/closure975/landfall_9cpd_24h_dt10_pr975catke_rhoeweno.jld2"
+$J analysis/animate_forward.jl figures/animations/micro_mp1m_snow.mp4 "MP1M + snow pathway=runs/closure975/landfall_9cpd_24h_dt10_micro_mp1m_snow.jld2"
+$J analysis/animate_forward.jl figures/animations/micro_mpne_limited.mp4 "MPNE1M, donor-limited=runs/closure975/landfall_9cpd_24h_dt10_micro_mpne_limited.jld2"
+$J analysis/animate_forward.jl figures/animations/micro_precip_rate.mp4 "no snow (#975 default)=runs/closure975/landfall_9cpd_24h_dt10_pr975default.jld2" "MP1M + snow=runs/closure975/landfall_9cpd_24h_dt10_micro_mp1m_snow.jld2" "MPNE1M limited=runs/closure975/landfall_9cpd_24h_dt10_micro_mpne_limited.jld2"
+AR_ANIM_PREVIEW=figures/animations/event72h_column_tke_last.png $J analysis/animate_forward.jl figures/animations/event72h_column_tke.mp4 "72 h, column parent, TKE, real sun=reactant_landfall_era5_9cpd_cuda_hydro_72h_dt10_etopo_s2_column_sun_tke_nobal.jld2"

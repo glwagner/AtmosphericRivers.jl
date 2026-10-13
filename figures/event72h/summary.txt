@@ -1,0 +1,10 @@
+IVT + 6 h: north band model  206 ERA5  178 | domain max model   727 ERA5   680 (inside the nest box)
+IVT +12 h: north band model  203 ERA5  185 | domain max model  1037 ERA5   967 (inside the nest box)
+IVT +24 h: north band model  507 ERA5  381 | domain max model  1263 ERA5  1158 (inside the nest box)
+IVT +48 h: north band model  257 ERA5  219 | domain max model  1459 ERA5  1150 (inside the nest box)
+IVT +72 h: north band model  542 ERA5  471 | domain max model  1217 ERA5   974 (inside the nest box)
+precip 0–24 h: target model  10.4 ERA5  12.5 mm | north model   6.6 ERA5  13.8 mm | model interior max   53
+precip 0–48 h: target model  71.7 ERA5  74.4 mm | north model  17.9 ERA5  39.0 mm | model interior max  207
+precip 0–72 h: target model 110.2 ERA5 112.0 mm | north model  28.7 ERA5  57.0 mm | model interior max  353
+ρe: max 56.3 (at 10 h), min -0.00021 (at 70 h); final max 48.6, min 1.45e-10
+max |w| at 1.6 km: frame 1.26 → 1.78 m/s (peak 2.86 at 7 h), interior 1.24 → 3.17 (peak 3.17 at 33 h)

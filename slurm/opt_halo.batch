@@ -1,0 +1,42 @@
+#!/bin/bash
+#SBATCH --job-name=ar-opthalo
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=150G
+#SBATCH --time=03:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# OPT-HALO (halo-fill fusion) driver: runs AR_OPT_SCRIPT (default perf/profile_window.jl) in the
+# production forward configuration of slurm/perf_window.batch, from the env AR_PERF_PROJECT
+# (default ~/AtmosphericRivers-opt-halo/env), private first depot ~/.julia-opt-halo.
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="$HOME/.julia-opt-halo:$HOME/.julia-perf:$HOME/.julia-975:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
+export HDF5_USE_FILE_LOCKING=FALSE
+JULIA=~/.juliaup/bin/julia
+PROJECT=${AR_PERF_PROJECT:-$HOME/AtmosphericRivers-opt-halo/env}
+SCRIPT=${AR_OPT_SCRIPT:-perf/profile_window.jl}
+GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | awk '{print $2}')
+nvidia-smi --query-gpu=name --format=csv
+
+DT=${AR_DT:-10}
+export AR_ARCH=cuda AR_DOMAIN=landfall AR_CELLS_PER_DEGREE=9
+export AR_PARENT=era5 AR_PARENT_HOURS=${AR_PARENT_HOURS:-6} AR_ERA5_REGION=-170.5,-109.5,24.5,60.5
+export AR_PARENT_UNIFORM_Z=1 AR_PARENT_PRESSURE=${AR_PARENT_PRESSURE:-column} AR_IC=interpolated AR_BALANCER=0
+export AR_COUPLED=1 AR_FLUX_ITERATIONS=10 AR_RADIATION=1 AR_RADIATION_EVERY=$(( 3600 / DT ))
+export AR_SOLAR=apparent AR_SST=${AR_SST:-era5}
+export AR_TERRAIN=etopo AR_TERRAIN_SMOOTHING=${AR_TERRAIN_SMOOTHING:-2}
+export AR_DT=$DT AR_STEPS=10 AR_CHUNK=10 AR_SPONGE=1 AR_OUTPUT=0 AR_OUTPUT_CLOSURE=1
+export AR_CLOSURE=${AR_CLOSURE:-tke} AR_TKE_FLAVOR=${AR_TKE_FLAVOR:-default}
+export AR_PROF_NSYS=0 AR_PERF_NSYS=0
+TAG=${AR_PERF_TAG:-opthalo}_$GPU
+env | grep '^AR_' | sort
+echo "=== [$(date -Is)] project $PROJECT, script $SCRIPT, tag $TAG ==="
+$JULIA --startup-file=no --project=$PROJECT -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' || exit 1
+mkdir -p perf/data
+if [ -n "${AR_OPT_PRE_SCRIPT:-}" ]; then
+    stdbuf -oL -eL $JULIA --startup-file=no --project=$PROJECT -t auto $AR_OPT_PRE_SCRIPT || echo "=== pre-script FAILED ==="
+fi
+AR_PROF_OUT=perf/data/$TAG stdbuf -oL -eL $JULIA --startup-file=no --project=$PROJECT -t auto $SCRIPT
+echo "=== [$(date -Is)] done (exit $?) ==="
