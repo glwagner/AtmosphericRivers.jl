@@ -3882,7 +3882,8 @@ if get(ENV, "AR_AD", "0") == "1"
 
     scheduled_Δt(aux, n, Δt) = haskey(aux, :dts) ? aux.dts[min(n, length(aux.dts))] : Δt
 
-    @inline function plane_flux(child, ::Val{(i₁, i₂)}) where {i₁, i₂}
+    @inline function plane_flux(child, ::Val{faces}) where faces
+        i₁, i₂ = faces
         fields = prognostic_fields(child)
         ρu = view(interior(fields.ρu), i₁:i₂, :, :)
         q₋ = view(interior(fields[AD_CONTROL]), i₁-1:i₂-1, :, :) ./ view(interior(fields.ρᵈ), i₁-1:i₂-1, :, :)
