@@ -3722,29 +3722,38 @@ if get(ENV, "AR_AD", "0") == "1"
     ## ρu·ρqᵉ/ρᵈ = u·ρqᵉ. Moisture is the PROGNOSTIC ρqᵉ — total non-precipitating water (vapour + cloud)
     ## under the saturation-adjustment scheme — so the loss itself never differentiates through saturation
     ## adjustment; the dynamics still does. Accumulated over steps n > AR_AD_ACCUM_START.
+    ##
+    ## `AR_AD_PLANE_HALFWIDTH=h` (default 0) averages J over the 2h + 1 u-faces i₀ - h, …, i₀ + h, a zonal
+    ## band of planes instead of one, to smooth the near-plane sensitivity.
     function coastal_plane_aux()
         plane_λ = parse(Float64, get(ENV, "AR_AD_PLANE_LON", "-124.3"))
         φ₁ᵖ, φ₂ᵖ = parse.(Float64, split(get(ENV, "AR_AD_PLANE_LAT", "44.5:47.0"), [',', ':']))
         λf = Array(λnodes(host_grid, Face(), Center(), Center()))
         φc = Array(φnodes(host_grid, Center(), Center(), Center()))
         i₀ = argmin(abs.(λf .- plane_λ))
-        2 ≤ i₀ ≤ length(λf) - 1 || error("coastal_flux plane at $(plane_λ)° is on the domain wall")
+        h = parse(Int, get(ENV, "AR_AD_PLANE_HALFWIDTH", "0"))
+        i₁, i₂ = i₀ - h, i₀ + h
+        2 ≤ i₁ && i₂ ≤ length(λf) - 1 || error("coastal_flux planes $(i₁):$(i₂) reach the domain wall")
         band = findall(φ -> φ₁ᵖ ≤ φ ≤ φ₂ᵖ, φc)
         Nxh, Nyh, Nzh = size(host_grid)
+        Nf = i₂ - i₁ + 1
         L = sum(Oceananigans.Operators.Δyᶠᶜᶜ(i₀, j, 1, host_grid) for j in band)
-        W = zeros(FT, Nyh, Nzh)
-        for j in band, k in 1:Nzh
-            W[j, k] = Oceananigans.Operators.Axᶠᶜᶜ(i₀, j, k, host_grid) / L
+        W = zeros(FT, Nf, Nyh, Nzh)
+        for (m, i) in enumerate(i₁:i₂)
+            Lᵢ = sum(Oceananigans.Operators.Δyᶠᶜᶜ(i, j, 1, host_grid) for j in band)
+            for j in band, k in 1:Nzh
+                W[m, j, k] = Oceananigans.Operators.Axᶠᶜᶜ(i, j, k, host_grid) / Lᵢ / Nf
+            end
         end
-        stage(@sprintf("AD: coastal_flux plane at u-face i₀ = %d (λ = %.3f°), %d rows %.2f–%.2f°N, segment %.0f km",
-                       i₀, λf[i₀], length(band), φc[first(band)], φc[last(band)], L / 1e3))
+        stage(@sprintf("AD: coastal_flux plane at u-face i₀ = %d (λ = %.3f°), %d face(s) %.3f–%.3f°, %d rows %.2f–%.2f°N, segment %.0f km",
+                       i₀, λf[i₀], Nf, λf[i₁], λf[i₂], length(band), φc[first(band)], φc[last(band)], L / 1e3))
         ## Host-only description of the plane, for the output file; kept out of the traced argument.
-        global COASTAL_PLANE_META = (λ = λf[i₀], i = i₀, φ_band = (φc[first(band)], φc[last(band)]),
-                                     rows = band, segment_m = L)
+        global COASTAL_PLANE_META = (λ = λf[i₀], i = i₀, halfwidth = h, λ_range = (λf[i₁], λf[i₂]),
+                                     φ_band = (φc[first(band)], φc[last(band)]), rows = band, segment_m = L)
         return (; plane_weights = Reactant.to_rarray(W),
-                  plane_acc = Reactant.to_rarray(zeros(FT, Nyh, Nzh)),
+                  plane_acc = Reactant.to_rarray(zeros(FT, Nf, Nyh, Nzh)),
                   start = Reactant.ConcreteRNumber(parse(Int, get(ENV, "AR_AD_ACCUM_START", "0"))),
-                  plane_i = Val(i₀))
+                  plane_i = Val((i₁, i₂)))
     end
 
     ad_aux = if COASTAL_FLUX_LOSS
@@ -3873,11 +3882,11 @@ if get(ENV, "AR_AD", "0") == "1"
 
     scheduled_Δt(aux, n, Δt) = haskey(aux, :dts) ? aux.dts[min(n, length(aux.dts))] : Δt
 
-    @inline function plane_flux(child, ::Val{i₀}) where i₀
+    @inline function plane_flux(child, ::Val{(i₁, i₂)}) where {i₁, i₂}
         fields = prognostic_fields(child)
-        ρu = view(interior(fields.ρu), i₀, :, :)
-        q₋ = view(interior(fields[AD_CONTROL]), i₀ - 1, :, :) ./ view(interior(fields.ρᵈ), i₀ - 1, :, :)
-        q₊ = view(interior(fields[AD_CONTROL]), i₀, :, :) ./ view(interior(fields.ρᵈ), i₀, :, :)
+        ρu = view(interior(fields.ρu), i₁:i₂, :, :)
+        q₋ = view(interior(fields[AD_CONTROL]), i₁-1:i₂-1, :, :) ./ view(interior(fields.ρᵈ), i₁-1:i₂-1, :, :)
+        q₊ = view(interior(fields[AD_CONTROL]), i₁:i₂, :, :) ./ view(interior(fields.ρᵈ), i₁:i₂, :, :)
         return ρu .* (q₋ .+ q₊) ./ 2
     end
 
@@ -4269,6 +4278,8 @@ if get(ENV, "AR_AD", "0") == "1"
                     m = COASTAL_PLANE_META
                     file["ad/plane_lambda"]   = m.λ
                     file["ad/plane_i"]        = m.i
+                    file["ad/plane_halfwidth"] = m.halfwidth
+                    file["ad/plane_lambda_range"] = collect(m.λ_range)
                     file["ad/plane_phi_band"] = collect(m.φ_band)
                     file["ad/plane_rows"]     = collect(m.rows)
                     file["ad/plane_segment_m"] = m.segment_m

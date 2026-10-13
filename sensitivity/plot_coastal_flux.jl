@@ -19,7 +19,9 @@ function load_plane(path)
     jldopen(path, "r") do file
         (; λ = Float64(file["ad/plane_lambda"]), band = Float64.(file["ad/plane_phi_band"]),
            rows = Int.(file["ad/plane_rows"]), steps = Int(file["ad/steps"]),
-           dt = Float64(file["ad/dt"]), units = file["ad/loss_units"])
+           dt = Float64(file["ad/dt"]), units = file["ad/loss_units"],
+           λ_range = haskey(file, "ad/plane_lambda_range") ? Float64.(file["ad/plane_lambda_range"]) :
+                     [Float64(file["ad/plane_lambda"]), Float64(file["ad/plane_lambda"])])
     end
 end
 
@@ -69,7 +71,10 @@ function plot_coastal(d, s, p, out)
     contour!(ax, d.λ, d.φ, d.h; levels = 500:500:3000, color = (:gray35, 0.6), linewidth = 0.5)
     lines!(ax, coast...; color = :black, linewidth = 0.8)
     lines!(ax, states...; color = (:black, 0.5), linewidth = 0.4)
-    lines!(ax, [p.λ, p.λ], collect(p.band); color = :green, linewidth = 4)
+    λ₁, λ₂ = p.λ_range
+    λ₁ == λ₂ ? lines!(ax, [p.λ, p.λ], collect(p.band); color = :green, linewidth = 4) :
+               poly!(ax, Point2f[(λ₁, p.band[1]), (λ₂, p.band[1]), (λ₂, p.band[2]), (λ₁, p.band[2])];
+                     color = :transparent, strokecolor = :green, strokewidth = 3)
     xlims!(ax, extrema(d.λf)...); ylims!(ax, extrema(d.φf)...)
     Colorbar(fig[1, 2], hm; label = "kg m⁻¹ s⁻¹ per (kg m⁻²) per (100 km)²")
 
@@ -84,7 +89,7 @@ function plot_coastal(d, s, p, out)
     λsec = repeat(d.λ, 1, Nz)
     hm2 = scatter!(ax2, vec(λsec), vec(zc) ./ 1e3; color = vec(sec), colormap = :balance,
                    colorrange = (-slim, slim), marker = :rect, markersize = 6)
-    vlines!(ax2, [p.λ]; color = :green, linewidth = 2)
+    vlines!(ax2, unique(p.λ_range); color = :green, linewidth = 2)
     ylims!(ax2, 0, 10)
     Colorbar(fig[2, 2], hm2; label = "kg m⁻¹ s⁻¹ per (kg m⁻³)")
 
