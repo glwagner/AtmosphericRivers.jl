@@ -22,11 +22,13 @@ include(joinpath(@__DIR__, "region.jl"))
 Contract with reactant_downscale.jl's AD block. `λ`, `φ` are the child's cell-CENTRE longitudes and
 latitudes (uniform lat-lon grid), `h` its terrain (unused: the region is a fixed polygon — see
 region.jl for why the idealized terrain is not used to find the crest). Returns normalized area
-weights over `TARGET_POLYGON`, summing to 1.
+weights over the region `target_region()` selects (`AR_AD_REGION=westside`: `TARGET_POLYGON`,
+the default; `AR_AD_REGION=pnw`: Washington + Oregon land, `PNW_POLYGON`), summing to 1.
 """
 function precipitation_weights(λ, φ, h = nothing)
-    w, area = region_weights(centres_to_faces(λ), centres_to_faces(φ))
-    @info "sensitivity: target region '$TARGET_NAME' — $(round(Int, area / 1e6)) km², " *
+    polygon, name = target_region()   # AR_AD_REGION = westside (default) | pnw
+    w, area = region_weights(centres_to_faces(λ), centres_to_faces(φ); polygon)
+    @info "sensitivity: target region '$name' — $(round(Int, area / 1e6)) km², " *
           "$(count(>(0), w)) cells with weight > 0"
     return w
 end
