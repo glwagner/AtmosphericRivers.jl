@@ -1,0 +1,7 @@
+# 6 km (18 cpd) forward: figures/sixkm/ (vivid precip style, analysis/precip_colors.jl)
+$J analysis/compare_precipitation.jl figures/sixkm/precip_6km_vs_12km_24h.png "6 km MP1M+snow #975 TKE=runs/sixkm/landfall_18cpd_24h_dt5_s2.jld2" "12 km MP1M+snow #975 TKE=runs/closure975/landfall_9cpd_24h_dt10_micro_mp1m_snow.jld2" "12 km no snow #975 TKE=runs/closure975/landfall_9cpd_24h_dt10_pr975default_rhoeweno.jld2"
+$J analysis/compare_closures.jl figures/sixkm/closure_6km_24h.png "6 km=runs/sixkm/landfall_18cpd_24h_dt5_s2.jld2"   # one grid per call (mixed resolutions → DimensionMismatch)
+AR_LEADS=6,12,24 $J analysis/event_summary.jl runs/sixkm/landfall_18cpd_24h_dt5_s2.jld2
+for f in runs/sixkm/landfall_18cpd_24h_dt5_s2_*.{png,mp4}; do cp "$f" figures/sixkm/event_$(basename "$f" | sed "s/landfall_18cpd_24h_dt5_s2_//"); done
+AR_ANIM_PREVIEW=figures/sixkm/forward_6km_last.png $J analysis/animate_forward.jl figures/sixkm/forward_6km.mp4 "6 km, #975 TKE, MP1M+snow=runs/sixkm/landfall_18cpd_24h_dt5_s2.jld2"
+AR_ANIM_PREVIEW=figures/sixkm/precip_rate_6km_vs_12km_last.png $J analysis/animate_forward.jl figures/sixkm/precip_rate_6km_vs_12km.mp4 "6 km=runs/sixkm/landfall_18cpd_24h_dt5_s2.jld2" "12 km=runs/closure975/landfall_9cpd_24h_dt10_micro_mp1m_snow.jld2"

@@ -1,0 +1,45 @@
+#!/bin/bash
+#SBATCH --job-name=ar-6km
+#SBATCH --partition=gpuprod,gpuprodflex,gpua100,gpua100largex4spot
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=200G
+#SBATCH --time=12:00:00
+#SBATCH --output=slurm/%x-%j.log
+
+# 6 km (18 cells/degree) forward of the Dec 2025 PNW AR with the best physics found at 12 km:
+# env-micro (Breeze #975 TKE + MP1M snow pathway), #975 default closure, bounded WENO ρe, per-column
+# parent pressure, ERA5 SST, apparent sun, ETOPO terrain, coupled + hourly RRTMGP, eager CUDA.
+# Same as slurm/closure975_compare.batch except the resolution knobs.
+#
+#   sbatch --export=ALL,AR_DT=5,AR_TAG=dt5_s2 slurm/sixkm_forward.batch
+cd "$SLURM_SUBMIT_DIR"
+export JULIA_DEPOT_PATH="${AR_DEPOT:-$HOME/.julia-micro:$HOME/.julia-975}:$HOME/.julia-prod:$HOME/.julia"
+export JULIA_NUM_PRECOMPILE_TASKS=${SLURM_CPUS_PER_TASK:-12}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-12}
+export HDF5_USE_FILE_LOCKING=FALSE
+JULIA=~/.juliaup/bin/julia
+PROJECT=${AR_CLOSURE_PROJECT:-$HOME/AtmosphericRivers-micro/env-micro}
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+DT=${AR_DT:-5}
+HOURS=${AR_RUN_HOURS:-24}
+CPD=${AR_CELLS_PER_DEGREE:-18}
+export AR_ARCH=cuda AR_DOMAIN=${AR_DOMAIN:-landfall} AR_CELLS_PER_DEGREE=$CPD
+export AR_PARENT=era5 AR_PARENT_HOURS=$(( HOURS + 1 )) AR_ERA5_REGION=-170.5,-109.5,24.5,60.5
+export AR_PARENT_UNIFORM_Z=1 AR_PARENT_PRESSURE=${AR_PARENT_PRESSURE:-column} AR_IC=interpolated AR_BALANCER=0
+export AR_COUPLED=1 AR_FLUX_ITERATIONS=10 AR_RADIATION=1 AR_RADIATION_EVERY=$(( 3600 / DT ))
+export AR_SOLAR=apparent AR_SST=${AR_SST:-era5} AR_MICROPHYSICS=${AR_MICROPHYSICS:-equilibrium}
+export AR_TERRAIN=etopo AR_TERRAIN_SMOOTHING=${AR_TERRAIN_SMOOTHING:-2}
+# Davies frame: same PHYSICAL width as the 12 km runs (5 cells × 12 km ≈ 10 cells × 6 km).
+export AR_RELAX_WIDTH=${AR_RELAX_WIDTH:-$(( 5 * CPD / 9 ))}
+export AR_DT=$DT AR_STEPS=$(( HOURS * 3600 / DT )) AR_CHUNK=$(( 1800 / DT )) AR_SPONGE=1
+export AR_CLOSURE=${AR_CLOSURE:-tke} AR_TKE_FLAVOR=${AR_TKE_FLAVOR:-default} AR_OUTPUT_CLOSURE=1
+export AR_ASYNC_OUTPUT=${AR_ASYNC_OUTPUT:-1}
+export AR_OUTPUT=1 AR_OUTPUT_FILE=runs/sixkm/landfall_${CPD}cpd_${HOURS}h_${AR_TAG:-dt$DT}.jld2
+env | grep '^AR_' | sort
+echo "=== [$(date -Is)] project $PROJECT ==="
+stdbuf -oL -eL $JULIA --startup-file=no --project=$PROJECT -t auto reactant_downscale.jl
+status=$?
+echo "=== [$(date -Is)] done (exit $status) ==="
+exit $status
