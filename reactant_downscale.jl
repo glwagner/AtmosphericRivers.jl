@@ -2037,6 +2037,38 @@ if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_SAFE_MICROPHYSICS", "1") == 
     @info "shim 18: AD-safe snow–rain accretion (√ radicand floored)"
 end
 
+# ### Shim 19 (`AR_AD_FROZEN_MICRO`, default off): frozen-microphysics adjoint
+#
+# At 6 km (18 cpd) the coastal-flux adjoint explodes even WITHOUT a closure: after 30 min a handful of
+# cells at ~2.3–2.7 km over the Oregon Coast Range (near the melting level) reach |∂J/∂ρqᵉ| ~ 1e6 with
+# grid-scale sign alternation, and by 1 h the gradient is all-NaN (job 2725; with main TKE + frozen K the
+# 1 h max is 3.8e15 domain-wide, job 2718). 2 vs 1 acoustic substeps makes no difference. The same configuration at
+# 3 cpd is O(100–700) at 1–6 h. A thin, grid-scale, fast-growing mode in the moist layer is the
+# signature of the tangent-linear of explicit, rate-limited microphysical sources (process rates
+# that are stiff relative to Δt once resolved updrafts load the column with condensate) — the
+# other standard simplification in operational moist adjoints (Mahfouf 1999; Janisková et al.
+# 1999; Errico & Raeder 1999). So, optionally: the primal is unchanged, but the INCREMENT that
+# `compute_microphysical_tendencies!` adds to every tendency is passed through `ignore_derivatives`
+# — the microphysical source terms act with the reference trajectory's rates, transport, dynamics,
+# saturation adjustment and sedimentation are still differentiated.
+if get(ENV, "AR_AD", "0") == "1" && get(ENV, "AR_AD_FROZEN_MICRO", "0") == "1"
+    @eval function Breeze.AtmosphereModels.compute_microphysical_tendencies!(
+                microphysics::Breeze.Microphysics.BulkMicrophysics,
+                model::Breeze.AtmosphereModel{<:Any, <:Any, <:ReactantState})
+        AM = Breeze.AtmosphereModels
+        G = model.timestepper.Gⁿ
+        names = (AM.moisture_prognostic_name(microphysics), AM.prognostic_field_names(microphysics)...)
+        before = map(n -> copy(parent(getproperty(G, n))), names)
+        invoke(AM.compute_microphysical_tendencies!, Tuple{Any, Any}, microphysics, model)
+        for (n, b) in zip(names, before)
+            d = parent(getproperty(G, n))
+            d isa Reactant.TracedRArray && (d .= b .+ Reactant.Ops.ignore_derivatives(d .- b))
+        end
+        return nothing
+    end
+    @info "shim 19: frozen-microphysics adjoint (microphysical tendency increments pass through ignore_derivatives)"
+end
+
 # ### Shim 14 (`AR_AD_SAFE_TKE`, default on under `AR_AD=1`): no infinite derivatives in the TKE closure
 #
 # Breeze's TKE closure evaluates `√N²⁺` and `√|e|` where both can be exactly 0, and hides the result
